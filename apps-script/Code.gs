@@ -166,13 +166,25 @@ function getCategorias_() {
   var idxMin = norm.indexOf("inicial minima");
   var idxSug = norm.indexOf("inicial sugerida");
 
-  // Las columnas desde "AIRR" en adelante son datos auxiliares, no plazos.
-  var endCol = norm.indexOf("airr");
-  if (endCol === -1) endCol = headers.length;
-
-  // Etiqueta de bloque en la fila de arriba ("IVA FINANCIADO SI" / "IVA FINANCIADO NO"),
-  // se arrastra hacia la derecha hasta la siguiente etiqueta.
+   // Bloque AIRR (L:N): la palabra "AIRR" puede estar en la fila de encabezados o en la de arriba.
   var groupRow = hr > 0 ? values[hr - 1] : [];
+  var airrCol = norm.indexOf("airr");
+  if (airrCol === -1) {
+    for (var gc = 0; gc < groupRow.length; gc++) {
+      if (normalizeName_(groupRow[gc]) === "airr") { airrCol = gc; break; }
+    }
+  }
+  // Desde AIRR en adelante son datos auxiliares, no plazos con fórmula.
+  var endCol = airrCol !== -1 ? airrCol : headers.length;
+
+  var airrCols = [];
+  if (airrCol !== -1) {
+    for (var ac = airrCol; ac < headers.length; ac++) {
+      var am = parseTermHeader_(norm[ac]);
+      if (am !== null) airrCols.push({ col: ac, meses: am });
+    }
+  }
+
   var mode = "ambos";
   var termCols = [];
   var usados = {};
@@ -192,7 +204,7 @@ function getCategorias_() {
     termCols.push({ col: c, meses: meses, mode: mode });
   }
 
-  if (termCols.length === 0) {
+    if (termCols.length === 0 && airrCols.length === 0) {
     throw new Error(
       'La hoja "' + SHEET_CATEGORIA + '" no tiene columnas de plazo reconocibles. Encabezados leídos: ' +
       headers.join(" | ")
@@ -209,7 +221,7 @@ function getCategorias_() {
 
     var ck = normalizeName_(nombre);
     if (!byKey[ck]) {
-      byKey[ck] = { nombre: nombre, inicialMinima: null, inicialSugerida: null, plazosSi: [], plazosNo: [] };
+      byKey[ck] = { nombre: nombre, inicialMinima: null, inicialSugerida: null, plazosSi: [], plazosNo: [], airr: []  };
       order.push(ck);
     }
     var cat = byKey[ck];
@@ -227,12 +239,20 @@ function getCategorias_() {
       if (tc.mode === "si" || tc.mode === "ambos") cat.plazosSi.push(plazo);
       if (tc.mode === "no" || tc.mode === "ambos") cat.plazosNo.push(plazo);
     }
+    for (var a = 0; a < airrCols.length; a++) {
+      var tasa = parseAirr_(row[airrCols[a].col]);
+      if (tasa === null) continue; // "Sin calculo" o vacío = plazo no disponible
+      var mesesA = airrCols[a].meses;
+      var yaEsta = cat.airr.some(function (p) { return p.meses === mesesA; });
+      if (!yaEsta) cat.airr.push({ meses: mesesA, tasa: tasa });
+    }
   }
 
   return order.map(function (k) {
     var cat = byKey[k];
     cat.plazosSi.sort(function (a, b) { return a.meses - b.meses; });
     cat.plazosNo.sort(function (a, b) { return a.meses - b.meses; });
+    cat.airr.sort(function (a, b) { return a.meses - b.meses; });
     return cat;
   });
 }
@@ -374,6 +394,18 @@ function extractMultiplier_(text) {
     if (isFinite(v) && v > 1 && v < 3) return v;
   }
   return null;
+}
+/** AIRR de una celda: 0.25, 25 o "25%" -> 0.25. "Sin calculo"/vacío -> null. */
+function parseAirr_(cell) {
+  if (typeof cell === "number") {
+    if (!isFinite(cell) || cell <= 0) return null;
+    return cell > 1 ? cell / 100 : cell;
+  }
+  var m = String(cell || "").match(/^\s*(\d+(?:[.,]\d+)?)\s*%?\s*$/);
+  if (!m) return null;
+  var v = parseFloat(m[1].replace(",", "."));
+  if (!isFinite(v) || v <= 0) return null;
+  return v > 1 ? v / 100 : v;
 }
 
 /** Número desde una celda (acepta números y textos como "$12.855,00"). */
