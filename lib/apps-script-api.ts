@@ -38,10 +38,6 @@ export type ReglaInicial = {
   digitos: number | null;
 };
 
-export type CategoriaFinanciamiento = {
-  nombre: string;
-  inicialMinima: ReglaInicial | null;
-  inicialSugerida: ReglaInicial | null;
   export type CategoriaFinanciamiento = {
   nombre: string;
   inicialMinima: ReglaInicial | null;
