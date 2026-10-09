@@ -49,7 +49,7 @@ const CATEGORIES_WITHOUT_SEPARATE_VAT = ["teair"];
 
 // false = el I.V.A. del cálculo de la cuota es (precio/1,03) x 16 %, igual que la versión vieja.
 // true  = usa el "IVA ajustado" de la columna G también para calcular la cuota.
-const USAR_IVA_AJUSTADO_EN_CUOTA = false;
+const USAR_IVA_AJUSTADO_EN_CUOTA = true;
 
 // Paso de redondeo de la inicial solo cuando la hoja no trae una fórmula utilizable
 const INITIAL_STEP = 500;
@@ -126,18 +126,184 @@ function toRule(rule: ReglaInicial | null, fallbackRate: number) {
   };
 }
 
-// TIR (por mes) de un flujo de caja; el flujo[0] es negativo (mes 0).
-function calculateIRR(flows: number[]): number {
-  const npv = (r: number) =>
-    flows.reduce((acc, cf, t) => acc + cf / Math.pow(1 + r, t), 0);
-  let lo = -0.99,
-    hi = 1;
-  for (let i = 0; i < 200; i++) {
-    const mid = (lo + hi) / 2;
-    if (npv(mid) > 0) lo = mid;
-    else hi = mid;
+// TIR (por mes) de un flujo de caja. Igual que la versión vieja: amplía el rango
+// hasta encontrar cambio de signo y biseca. Devuelve null si no se puede calcular.
+function calculateIRR(cashFlows: number[]): number | null {
+  if (cashFlows.length < 2) return null;
+
+  const hasPositive = cashFlows.some((v) => v > 0);
+  const hasNegative = cashFlows.some((v) => v < 0);
+  if (!hasPositive || !hasNegative) return null;
+
+  const npv = (rate: number) =>
+    cashFlows.reduce((acc, cf, i) => acc + cf / Math.pow(1 + rate, i), 0);
+
+  let low = -0.9999;
+  let high = 10;
+  let npvLow = npv(low);
+  let npvHigh = npv(high);
+
+  if (!Number.isFinite(npvLow) || !Number.isFinite(npvHigh)) return null;
+
+  let attempts = 0;
+  while (npvLow * npvHigh > 0 && attempts < 60) {
+    high *= 2;
+    npvHigh = npv(high);
+    if (!Number.isFinite(npvHigh)) return null;
+    attempts++;
   }
-  return (lo + hi) / 2;
+
+  if (npvLow * npvHigh > 0) return null;
+
+  for (let i = 0; i < 250; i++) {
+    const mid = (low + high) / 2;
+    const npvMid = npv(mid);
+
+    if (!Number.isFinite(npvMid)) return null;
+    if (Math.abs(npvMid) < 1e-10) return mid;
+
+    if (npvLow * npvMid < 0) {
+      high = mid;
+    } else {
+      low = mid;
+      npvLow = npvMid;
+    }
+  }
+
+  return (low + high) / 2;
+}
+
+function monthlyIrrToAnnual(irr: number | null) {
+  if (irr === null || !Number.isFinite(irr)) return null;
+  return Math.pow(1 + irr, 12) - 1;
+}
+
+// Flujo de caja de la operación.
+//  - I.V.A. financiado ("si"): mes 0 = -(precio comercial - inicial); meses 1..n = cuota
+//  - I.V.A. aparte ("no"):     mes 0 igual; mes 1 = +I.V.A.; meses 2..n+1 = cuota
+function buildCashFlows(params: {
+  commercialPrice: number;
+  initialAmount: number;
+  installments: number;
+  monthlyPayment: number;
+  ivaFinancing: PaymentMode;
+  ivaAmount: number;
+}) {
+  const {
+    commercialPrice,
+    initialAmount,
+    installments,
+    monthlyPayment,
+    ivaFinancing,
+    ivaAmount,
+  } = params;
+
+  const flow0 = -commercialPrice + initialAmount;
+  const cuotas = Array.from({ length: installments }, () => monthlyPayment);
+
+  return ivaFinancing === "si"
+    ? [flow0, ...cuotas]
+    : [flow0, ivaAmount, ...cuotas];
+}
+
+// Cuota mínima con la que el AIRR llega al objetivo (bisección sobre la cuota),
+// redondeada hacia arriba a múltiplos de 5; si con el redondeo el AIRR queda
+// por debajo del objetivo, suma 5 más.
+function findMinimumMonthlyPayment(params: {
+  commercialPrice: number;
+  initialAmount: number;
+  installments: number;
+  targetAnnualRate: number;
+  ivaFinancing: PaymentMode;
+  ivaAmount: number;
+}) {
+  const {
+    commercialPrice,
+    initialAmount,
+    installments,
+    targetAnnualRate,
+    ivaFinancing,
+    ivaAmount,
+  } = params;
+
+  const empty = {
+    rawMonthlyPayment: 0,
+    roundedMonthlyPayment: 0,
+    monthlyIrr: null as number | null,
+    annualIrr: null as number | null,
+  };
+
+  const financedAmount = commercialPrice - initialAmount;
+
+  if (
+    !Number.isFinite(financedAmount) ||
+    financedAmount <= 0 ||
+    !Number.isInteger(installments) ||
+    installments <= 0
+  ) {
+    return empty;
+  }
+
+  const getAnnualIrrFromPayment = (payment: number) => {
+    const irr = calculateIRR(
+      buildCashFlows({
+        commercialPrice,
+        initialAmount,
+        installments,
+        monthlyPayment: payment,
+        ivaFinancing,
+        ivaAmount,
+      })
+    );
+    return { irr, annual: monthlyIrrToAnnual(irr) };
+  };
+
+  let low = 0;
+  let high = Math.max(financedAmount * 2, 1000);
+  let highResult = getAnnualIrrFromPayment(high);
+
+  let attempts = 0;
+  while (
+    (highResult.annual === null || highResult.annual < targetAnnualRate) &&
+    attempts < 100
+  ) {
+    high *= 2;
+    highResult = getAnnualIrrFromPayment(high);
+    attempts++;
+  }
+
+  if (highResult.annual === null || highResult.annual < targetAnnualRate) {
+    return empty;
+  }
+
+  for (let i = 0; i < 250; i++) {
+    const mid = (low + high) / 2;
+    const result = getAnnualIrrFromPayment(mid);
+
+    if (result.annual === null) {
+      low = mid;
+      continue;
+    }
+
+    if (result.annual >= targetAnnualRate) high = mid;
+    else low = mid;
+  }
+
+  const rawMonthlyPayment = high;
+  let roundedMonthlyPayment = roundUpToNearest5(rawMonthlyPayment);
+  let finalResult = getAnnualIrrFromPayment(roundedMonthlyPayment);
+
+  while (finalResult.annual !== null && finalResult.annual < targetAnnualRate) {
+    roundedMonthlyPayment += 5;
+    finalResult = getAnnualIrrFromPayment(roundedMonthlyPayment);
+  }
+
+  return {
+    rawMonthlyPayment,
+    roundedMonthlyPayment,
+    monthlyIrr: finalResult.irr,
+    annualIrr: finalResult.annual,
+  };
 }
 
 export default function Page() {
@@ -601,7 +767,7 @@ function CalculadoraFinanciamientoBNH() {
 
     // I.V.A. financiado (Sí): se suma al monto financiado y "I.V.A. a pagar en Bs" queda en 0.
     // I.V.A. no financiado (No): se paga aparte y trae el I.V.A. ajustado.
-    const ivaFinanced = ivaFinancing === "si" ? ivaCredito : 0;
+    
     const ivaSeparate = ivaFinancing === "no" ? ivaCredito : 0;
 
     const empty = {
@@ -620,45 +786,30 @@ function CalculadoraFinanciamientoBNH() {
     const term = categoryConfig.terms.find((t) => t.meses === safeInstallments);
     if (!term) return empty;
     if (safeBase - safeInitial <= 0) return empty;
+// Cálculo de la cuota igual que la versión vieja:
+// base imponible = precio / 1,03; I.V.A. = base x 16 %; IGTF 3 % sobre (base + I.V.A.)
+    const baseImponible = safeBase / CONTADO_DIVISOR;
+    const ivaCalculo = baseImponible * VAT_RATE;
+    const precioComercial = (baseImponible + ivaCalculo) * (1 + IGTF_RATE);
 
-    // 1) Tasa mensual a partir del AIRR objetivo de la hoja (exponente siempre 1/12)
-    const r = Math.pow(1 + term.airr, 1 / 12) - 1;
+    const search = findMinimumMonthlyPayment({
+      commercialPrice: precioComercial,
+      initialAmount: safeInitial,
+      installments: safeInstallments,
+      targetAnnualRate: term.airr,
+      ivaFinancing,
+      ivaAmount: ivaCalculo,
+    });
 
-    // Valor presente de $1 pagado cada mes durante n meses = VA(r; n; -1)
-    const va =
-      r > 0
-        ? (1 - Math.pow(1 + r, -safeInstallments)) / r
-        : safeInstallments;
+    const roundedMonthlyPayment = search.roundedMonthlyPayment;
 
-    // 2) Lo que la empresa adelanta en el mes 0 (igual que la versión vieja):
-    //    el IGTF del 3 % siempre se calcula también sobre el I.V.A.,
-    //    se financie o no el I.V.A.
-    const igtfSobreIva = ivaCredito * IGTF_RATE;
-    const montoMes0 = safeBase - safeInitial + ivaCredito + igtfSobreIva;
-
-    // 3) Cuota sin redondear según cómo se paga el IVA
-    const rawPayment =
-      ivaFinancing === "si"
-        ? montoMes0 / va // PAGO(r; n; -monto)
-        : (montoMes0 - ivaCredito / (1 + r)) / (va / (1 + r)); // IVA en mes 1, cuotas meses 2..n+1
-
-    const roundedMonthlyPayment = roundUpToNearest5(rawPayment);
-
-    // Monto financiado que se muestra en pantalla (con "No", el I.V.A. y su IGTF van aparte)
-    const igtfFinanciado = ivaFinancing === "si" ? igtfSobreIva : 0;
+    // Monto financiado que se muestra:
+    //  - I.V.A. financiado ("si"): precio comercial - inicial
+    //  - I.V.A. aparte ("no"): precio - inicial
     const financedAmount =
-      safeBase - safeInitial + ivaFinanced + igtfFinanciado;
-
-    // 4) Control: AIRR resultante con la cuota ya redondeada
-    let airrResultante: number | null = null;
-    if (roundedMonthlyPayment > 0) {
-      const cuotas = Array(safeInstallments).fill(roundedMonthlyPayment);
-      const flows =
-        ivaFinancing === "si"
-          ? [-montoMes0, ...cuotas]
-          : [-montoMes0, ivaCredito, ...cuotas];
-      airrResultante = Math.pow(1 + calculateIRR(flows), 12) - 1;
-    }
+      ivaFinancing === "si"
+        ? precioComercial - safeInitial
+        : safeBase - safeInitial;
 
     const totalToPay =
       safeInitial + ivaSeparate + roundedMonthlyPayment * safeInstallments;
@@ -668,8 +819,10 @@ function CalculadoraFinanciamientoBNH() {
       totalToPay,
       ivaToPayField: ivaSeparate,
       financedAmount,
-      airrResultante,
+      airrResultante: search.annualIrr,
       airrObjetivo: term.airr as number | null,
+    };
+   
     };
   }, [
     safeBaseForRules,
