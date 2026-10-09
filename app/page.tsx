@@ -1,7 +1,8 @@
-"use client";
+
+        "use client";
 
 import Image from "next/image";
-import { useEffect, useMemo, useState } from "react";
+import React, { useEffect, useMemo, useState } from "react";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
@@ -25,39 +26,26 @@ import {
   type PlazoCategoria,
   type ReglaInicial,
 } from "@/lib/apps-script-api";
-import { evaluateInitialFormula } from "@/lib/initial-formula";
+import {
+  evaluateInitialFormula,
+  evaluateInstallmentFormula,
+} from "@/lib/initial-formula";
 
-// Las categorías, la inicial mínima/sugerida y el AIRR objetivo por plazo salen de la
+// Las categorías, la inicial mínima/sugerida y la fórmula de cuota por plazo salen de la
 // hoja "CATEGORIA" del Google Sheet. Solo estos valores no están en la hoja:
 const VAT_RATE = 0.16;
 const MIN_INITIAL_RATE_DEFAULT = 0.2;
 const SUGGESTED_INITIAL_RATE_DEFAULT = 0.25;
-// OJO: esta clave queda visible en el navegador. Para algo realmente privado,
-// valídala en el servidor (route handler + cookie httpOnly o middleware).
 const ACCESS_PASSWORD = "BNH2026";
-
-// IGTF: ya viene incluido en el precio de crédito sobre la base; si el I.V.A. se
-// financia, también se financia el IGTF sobre el I.V.A.
-const IGTF_RATE = 0.03;
-
-// Control interno: muestra en pantalla el AIRR resultante de la cuota redondeada.
-// Dejar en false en producción (con true además se avisa por console.warn si queda bajo el objetivo).
-const SHOW_AIRR_CONTROL: boolean = false;
 
 // Categorías (nombre normalizado) que no permiten pagar el I.V.A. por separado
 const CATEGORIES_WITHOUT_SEPARATE_VAT = ["teair"];
-
-// false = el I.V.A. del cálculo de la cuota es (precio/1,03) x 16 %, igual que la versión vieja.
-// true  = usa el "IVA ajustado" de la columna G también para calcular la cuota.
-const USAR_IVA_AJUSTADO_EN_CUOTA = true;
 
 // Paso de redondeo de la inicial solo cuando la hoja no trae una fórmula utilizable
 const INITIAL_STEP = 500;
 
 // El precio incluye 3 %; el I.V.A. = (precio / 1,03) x 16 % (contado y crédito)
 const CONTADO_DIVISOR = 1.03;
-
-const EMAIL_REGEX = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
 
 type CategoryConfig = {
   nombre: string;
@@ -84,11 +72,9 @@ function formatCurrency(value: number) {
   }).format(value);
 }
 
-// Redondea la cuota hacia arriba al múltiplo de 5; el epsilon evita que el ruido
-// de punto flotante (ej. 100.0000000001) suba la cuota $5 de más.
 function roundUpToNearest5(value: number) {
   if (!Number.isFinite(value) || value <= 0) return 0;
-  return Math.ceil(value / 5 - 1e-9) * 5;
+  return Math.ceil(value / 5) * 5;
 }
 
 function roundUpToMultiple(value: number, step: number) {
@@ -126,190 +112,22 @@ function toRule(rule: ReglaInicial | null, fallbackRate: number) {
   };
 }
 
-// TIR (por mes) de un flujo de caja. Igual que la versión vieja: amplía el rango
-// hasta encontrar cambio de signo y biseca. Devuelve null si no se puede calcular.
-function calculateIRR(cashFlows: number[]): number | null {
-  if (cashFlows.length < 2) return null;
-
-  const hasPositive = cashFlows.some((v) => v > 0);
-  const hasNegative = cashFlows.some((v) => v < 0);
-  if (!hasPositive || !hasNegative) return null;
-
-  const npv = (rate: number) =>
-    cashFlows.reduce((acc, cf, i) => acc + cf / Math.pow(1 + rate, i), 0);
-
-  let low = -0.9999;
-  let high = 10;
-  let npvLow = npv(low);
-  let npvHigh = npv(high);
-
-  if (!Number.isFinite(npvLow) || !Number.isFinite(npvHigh)) return null;
-
-  let attempts = 0;
-  while (npvLow * npvHigh > 0 && attempts < 60) {
-    high *= 2;
-    npvHigh = npv(high);
-    if (!Number.isFinite(npvHigh)) return null;
-    attempts++;
-  }
-
-  if (npvLow * npvHigh > 0) return null;
-
-  for (let i = 0; i < 250; i++) {
-    const mid = (low + high) / 2;
-    const npvMid = npv(mid);
-
-    if (!Number.isFinite(npvMid)) return null;
-    if (Math.abs(npvMid) < 1e-10) return mid;
-
-    if (npvLow * npvMid < 0) {
-      high = mid;
-    } else {
-      low = mid;
-      npvLow = npvMid;
-    }
-  }
-
-  return (low + high) / 2;
-}
-
-function monthlyIrrToAnnual(irr: number | null) {
-  if (irr === null || !Number.isFinite(irr)) return null;
-  return Math.pow(1 + irr, 12) - 1;
-}
-
-// Flujo de caja de la operación.
-//  - I.V.A. financiado ("si"): mes 0 = -(precio comercial - inicial); meses 1..n = cuota
-//  - I.V.A. aparte ("no"):     mes 0 igual; mes 1 = +I.V.A.; meses 2..n+1 = cuota
-function buildCashFlows(params: {
-  commercialPrice: number;
-  initialAmount: number;
-  installments: number;
-  monthlyPayment: number;
-  ivaFinancing: PaymentMode;
-  ivaAmount: number;
-}) {
-  const {
-    commercialPrice,
-    initialAmount,
-    installments,
-    monthlyPayment,
-    ivaFinancing,
-    ivaAmount,
-  } = params;
-
-  const flow0 = -commercialPrice + initialAmount;
-  const cuotas = Array.from({ length: installments }, () => monthlyPayment);
-
-  return ivaFinancing === "si"
-    ? [flow0, ...cuotas]
-    : [flow0, ivaAmount, ...cuotas];
-}
-
-// Cuota mínima con la que el AIRR llega al objetivo (bisección sobre la cuota),
-// redondeada hacia arriba a múltiplos de 5; si con el redondeo el AIRR queda
-// por debajo del objetivo, suma 5 más.
-function findMinimumMonthlyPayment(params: {
-  commercialPrice: number;
-  initialAmount: number;
-  installments: number;
-  targetAnnualRate: number;
-  ivaFinancing: PaymentMode;
-  ivaAmount: number;
-}) {
-  const {
-    commercialPrice,
-    initialAmount,
-    installments,
-    targetAnnualRate,
-    ivaFinancing,
-    ivaAmount,
-  } = params;
-
-  const empty = {
-    rawMonthlyPayment: 0,
-    roundedMonthlyPayment: 0,
-    monthlyIrr: null as number | null,
-    annualIrr: null as number | null,
-  };
-
-  const financedAmount = commercialPrice - initialAmount;
-
-  if (
-    !Number.isFinite(financedAmount) ||
-    financedAmount <= 0 ||
-    !Number.isInteger(installments) ||
-    installments <= 0
-  ) {
-    return empty;
-  }
-
-  const getAnnualIrrFromPayment = (payment: number) => {
-    const irr = calculateIRR(
-      buildCashFlows({
-        commercialPrice,
-        initialAmount,
-        installments,
-        monthlyPayment: payment,
-        ivaFinancing,
-        ivaAmount,
-      })
-    );
-    return { irr, annual: monthlyIrrToAnnual(irr) };
-  };
-
-  let low = 0;
-  let high = Math.max(financedAmount * 2, 1000);
-  let highResult = getAnnualIrrFromPayment(high);
-
-  let attempts = 0;
-  while (
-    (highResult.annual === null || highResult.annual < targetAnnualRate) &&
-    attempts < 100
-  ) {
-    high *= 2;
-    highResult = getAnnualIrrFromPayment(high);
-    attempts++;
-  }
-
-  if (highResult.annual === null || highResult.annual < targetAnnualRate) {
-    return empty;
-  }
-
-  for (let i = 0; i < 250; i++) {
-    const mid = (low + high) / 2;
-    const result = getAnnualIrrFromPayment(mid);
-
-    if (result.annual === null) {
-      low = mid;
-      continue;
-    }
-
-    if (result.annual >= targetAnnualRate) high = mid;
-    else low = mid;
-  }
-
-  const rawMonthlyPayment = high;
-  let roundedMonthlyPayment = roundUpToNearest5(rawMonthlyPayment);
-  let finalResult = getAnnualIrrFromPayment(roundedMonthlyPayment);
-
-  while (finalResult.annual !== null && finalResult.annual < targetAnnualRate) {
-    roundedMonthlyPayment += 5;
-    finalResult = getAnnualIrrFromPayment(roundedMonthlyPayment);
-  }
-
-  return {
-    rawMonthlyPayment,
-    roundedMonthlyPayment,
-    monthlyIrr: finalResult.irr,
-    annualIrr: finalResult.annual,
-  };
+// Cuota nivelada (PMT) con tasa mensual; sin tasa, reparto simple.
+function monthlyPaymentFor(principal: number, monthlyRate: number, n: number) {
+  if (n <= 0) return 0;
+  if (monthlyRate <= 0) return principal / n;
+  return (principal * monthlyRate) / (1 - Math.pow(1 + monthlyRate, -n));
 }
 
 export default function Page() {
-  const [isAuthenticated, setIsAuthenticated] = useState(false);
-  const [password, setPassword] = useState("");
-  const [accessError, setAccessError] = useState("");
+  const [isAuthenticated, setIsAuthenticated] =
+    useState(false);
+
+  const [password, setPassword] =
+    useState("");
+
+  const [accessError, setAccessError] =
+    useState("");
 
   const handleLogin = () => {
     if (password === ACCESS_PASSWORD) {
@@ -324,7 +142,10 @@ export default function Page() {
     return (
       <div
         className="min-h-screen bg-[#f3f5f7] px-6 py-10"
-        style={{ fontFamily: "Verdana, sans-serif" }}
+        style={{
+          fontFamily:
+            "Verdana, sans-serif",
+        }}
       >
         <div className="mx-auto flex max-w-md flex-col items-center justify-center">
           <div className="mb-8 rounded-3xl bg-white px-8 py-6 shadow-sm ring-1 ring-gray-200">
@@ -345,7 +166,9 @@ export default function Page() {
               </CardTitle>
 
               <p className="mt-2 text-sm text-gray-600">
-                Ingrese la clave para acceder a la calculadora de financiamiento
+                Ingrese la clave para acceder
+                a la calculadora de
+                financiamiento
               </p>
             </CardHeader>
 
@@ -358,10 +181,11 @@ export default function Page() {
                 <Input
                   type="password"
                   value={password}
-                  onChange={(e) => setPassword(e.target.value)}
-                  onKeyDown={(e) => {
-                    if (e.key === "Enter") handleLogin();
-                  }}
+                  onChange={(e) =>
+                    setPassword(
+                      e.target.value
+                    )
+                  }
                   placeholder="Ingrese su clave"
                   className="h-12 rounded-xl"
                 />
@@ -369,7 +193,9 @@ export default function Page() {
 
               {accessError && (
                 <Alert className="border-red-200 bg-red-50">
-                  <AlertDescription>{accessError}</AlertDescription>
+                  <AlertDescription>
+                    {accessError}
+                  </AlertDescription>
                 </Alert>
               )}
 
@@ -624,11 +450,11 @@ function CalculadoraFinanciamientoBNH() {
   //  - Financiamiento del I.V.A. = Sí  -> se suma al monto financiado (y "I.V.A. a pagar en Bs" = 0)
   //  - Financiamiento del I.V.A. = No  -> se paga aparte: "I.V.A. a pagar en Bs" = I.V.A. ajustado
   const ivaCredito =
-  safeBaseForRules > 0
-    ? USAR_IVA_AJUSTADO_EN_CUOTA && ivaAjustadoDisponible
-      ? ivaAjustadoLista
-      : vatAmount
-    : 0;
+    safeBaseForRules > 0
+      ? ivaAjustadoDisponible
+        ? ivaAjustadoLista
+        : vatAmount
+      : 0;
 
   const contadoIva =
     contadoMonto > 0 ? (usaAjuste ? ivaAjustadoLista : contadoIvaNormal) : 0;
@@ -767,7 +593,7 @@ function CalculadoraFinanciamientoBNH() {
 
     // I.V.A. financiado (Sí): se suma al monto financiado y "I.V.A. a pagar en Bs" queda en 0.
     // I.V.A. no financiado (No): se paga aparte y trae el I.V.A. ajustado.
-    
+    const ivaFinanced = ivaFinancing === "si" ? ivaCredito : 0;
     const ivaSeparate = ivaFinancing === "no" ? ivaCredito : 0;
 
     const empty = {
@@ -775,8 +601,6 @@ function CalculadoraFinanciamientoBNH() {
       totalToPay: safeInitial,
       ivaToPayField: ivaSeparate,
       financedAmount: 0,
-      airrResultante: null as number | null,
-      airrObjetivo: null as number | null,
     };
 
     if (!categoryConfig || safeBase <= 0 || safeInstallments <= 0) {
@@ -785,31 +609,42 @@ function CalculadoraFinanciamientoBNH() {
 
     const term = categoryConfig.terms.find((t) => t.meses === safeInstallments);
     if (!term) return empty;
-    if (safeBase - safeInitial <= 0) return empty;
-// Cálculo de la cuota igual que la versión vieja:
-// base imponible = precio / 1,03; I.V.A. = base x 16 %; IGTF 3 % sobre (base + I.V.A.)
-    const baseImponible = safeBase / CONTADO_DIVISOR;
-    const ivaCalculo = baseImponible * VAT_RATE;
-    const precioComercial = (baseImponible + ivaCalculo) * (1 + IGTF_RATE);
 
-    const search = findMinimumMonthlyPayment({
-      commercialPrice: precioComercial,
-      initialAmount: safeInitial,
-      installments: safeInstallments,
-      targetAnnualRate: term.airr,
-      ivaFinancing,
-      ivaAmount: ivaCalculo,
+    // Base neta del crédito: Precio / 1,03 (igual que en la fórmula de la hoja)
+    const netBase = safeBase / CONTADO_DIVISOR;
+
+    if (netBase - safeInitial <= 0) return empty;
+
+    // Monto financiado = base neta - inicial + I.V.A. (solo si el I.V.A. se financia)
+    let financedAmount = netBase - safeInitial + ivaFinanced;
+
+    // Cuota: se evalúa la fórmula de la hoja CATEGORIA tal cual, por ejemplo
+    // CEILING(((Precio / 1.03) - Inicial) *1.20 / Cuotas, 10).
+    // Para que incluya el I.V.A. financiado se usa una "inicial efectiva" reducida
+    // en ese I.V.A.: (netBase - (inicial - iva)) = netBase - inicial + iva
+    let roundedMonthlyPayment = evaluateInstallmentFormula(term.formula, {
+      precio: safeBase,
+      inicial: safeInitial - ivaFinanced,
+      cuotas: safeInstallments,
     });
 
-    const roundedMonthlyPayment = search.roundedMonthlyPayment;
+    // Respaldo: fórmula no interpretable pero con multiplicador detectado
+    if (roundedMonthlyPayment === null && term.tasaMensual === null && term.factor) {
+      roundedMonthlyPayment = roundUpToMultiple(
+        (financedAmount * term.factor) / safeInstallments,
+        10
+      );
+    }
 
-    // Monto financiado que se muestra:
-    //  - I.V.A. financiado ("si"): precio comercial - inicial
-    //  - I.V.A. aparte ("no"): precio - inicial
-    const financedAmount =
-      ivaFinancing === "si"
-        ? precioComercial - safeInitial
-        : safeBase - safeInitial;
+    // Formato anterior de la hoja (tasa mensual): cuota nivelada PMT
+    if (roundedMonthlyPayment === null && term.tasaMensual !== null) {
+      financedAmount = safeBase - safeInitial + ivaFinanced;
+      roundedMonthlyPayment = roundUpToNearest5(
+        monthlyPaymentFor(financedAmount, term.tasaMensual, safeInstallments)
+      );
+    }
+
+    if (roundedMonthlyPayment === null) return empty;
 
     const totalToPay =
       safeInitial + ivaSeparate + roundedMonthlyPayment * safeInstallments;
@@ -819,10 +654,7 @@ function CalculadoraFinanciamientoBNH() {
       totalToPay,
       ivaToPayField: ivaSeparate,
       financedAmount,
-      airrResultante: search.annualIrr,
-      airrObjetivo: term.airr as number | null,
     };
-   
   }, [
     safeBaseForRules,
     numericInitial,
@@ -831,24 +663,6 @@ function CalculadoraFinanciamientoBNH() {
     ivaFinancing,
     categoryConfig,
   ]);
-
-  // Control de prueba: avisa si el AIRR resultante queda por debajo del objetivo
-  useEffect(() => {
-    if (!SHOW_AIRR_CONTROL) return;
-    const { airrResultante, airrObjetivo } = calculations;
-    if (airrResultante !== null && airrObjetivo !== null) {
-      console.log(
-        `AIRR objetivo ${(airrObjetivo * 100).toFixed(2)}% | resultante ${(
-          airrResultante * 100
-        ).toFixed(2)}%`
-      );
-      if (airrResultante < airrObjetivo - 1e-6) {
-        console.warn(
-          "El AIRR resultante quedó por debajo del objetivo: revisar el cálculo."
-        );
-      }
-    }
-  }, [calculations]);
 
   const isValid =
     !!categoryConfig &&
@@ -892,11 +706,6 @@ function CalculadoraFinanciamientoBNH() {
       setSendQuoteError(
         "Complete el nombre del lead, su email y el vendedor antes de enviar."
       );
-      return;
-    }
-
-    if (!EMAIL_REGEX.test(leadEmail.trim())) {
-      setSendQuoteError("El email del lead no tiene un formato válido.");
       return;
     }
 
@@ -944,13 +753,13 @@ function CalculadoraFinanciamientoBNH() {
     }
   };
 
-  const selectFont = { fontFamily: "Verdana, sans-serif" };
-  const catalogLoading = equiposLoading || categoriasLoading;
-
   return (
     <div
       className="min-h-screen bg-[#f3f5f7] px-4 py-6 md:px-6 md:py-8"
-      style={{ fontFamily: "Verdana, sans-serif" }}
+      style={{
+        fontFamily:
+          "Verdana, sans-serif",
+      }}
     >
       <div className="mx-auto max-w-7xl">
         <div className="mb-6 bg-transparent md:mb-8">
@@ -968,15 +777,19 @@ function CalculadoraFinanciamientoBNH() {
 
             <div>
               <h1 className="text-3xl font-bold tracking-tight text-gray-900 md:text-4xl">
-                Calculadora de Financiamiento
+                Calculadora de
+                Financiamiento
               </h1>
 
               <p className="mt-2 text-sm text-gray-600 md:text-base">
-                Simulación comercial para planes de financiamiento
+                Simulación comercial
+                para planes de
+                financiamiento
               </p>
 
               <div className="mt-4 inline-flex rounded-full bg-[#0d6f91]/10 px-4 py-2 text-sm font-medium text-[#0d6f91]">
-                BNH Medical · Herramienta interna
+                BNH Medical ·
+                Herramienta interna
               </div>
             </div>
           </div>
@@ -992,53 +805,84 @@ function CalculadoraFinanciamientoBNH() {
           <CardContent>
             <div className="grid gap-5 sm:grid-cols-2 lg:grid-cols-4">
               <div>
-                <Label className="mb-2 block">Nombre del lead</Label>
+                <Label className="mb-2 block">
+                  Nombre del lead
+                </Label>
+
                 <Input
                   type="text"
                   value={leadName}
-                  onChange={(e) => setLeadName(e.target.value)}
+                  onChange={(e) =>
+                    setLeadName(e.target.value)
+                  }
                   placeholder="Ej. Dr. Juan Rodríguez"
                   className="rounded-xl"
                 />
               </div>
 
               <div>
-                <Label className="mb-2 block">Teléfono</Label>
+                <Label className="mb-2 block">
+                  Teléfono
+                </Label>
+
                 <Input
                   type="tel"
                   value={leadPhone}
-                  onChange={(e) => setLeadPhone(e.target.value)}
+                  onChange={(e) =>
+                    setLeadPhone(e.target.value)
+                  }
                   placeholder="Ej. 0414-1234567"
                   className="rounded-xl"
                 />
               </div>
 
               <div>
-                <Label className="mb-2 block">Email</Label>
+                <Label className="mb-2 block">
+                  Email
+                </Label>
+
                 <Input
                   type="email"
                   value={leadEmail}
-                  onChange={(e) => setLeadEmail(e.target.value)}
+                  onChange={(e) =>
+                    setLeadEmail(e.target.value)
+                  }
                   placeholder="Ej. doctor@clinica.com"
                   className="rounded-xl"
                 />
               </div>
 
               <div>
-                <Label className="mb-2 block">Vendedor</Label>
+                <Label className="mb-2 block">
+                  Vendedor
+                </Label>
 
                 {vendedores.length > 0 ? (
-                  <Select value={vendedorName} onValueChange={setVendedorName}>
-                    <SelectTrigger className="rounded-xl" style={selectFont}>
+                  <Select
+                    value={vendedorName}
+                    onValueChange={setVendedorName}
+                  >
+                    <SelectTrigger
+                      className="rounded-xl"
+                      style={{
+                        fontFamily: "Verdana, sans-serif",
+                      }}
+                    >
                       <SelectValue placeholder="Seleccione un vendedor" />
                     </SelectTrigger>
 
-                    <SelectContent style={selectFont}>
+                    <SelectContent
+                      style={{
+                        fontFamily: "Verdana, sans-serif",
+                      }}
+                    >
                       {vendedores.map((nombre) => (
                         <SelectItem
                           key={nombre}
                           value={nombre}
-                          style={selectFont}
+                          style={{
+                            fontFamily: "Verdana, sans-serif",
+                          }}
                         >
                           {nombre}
                         </SelectItem>
@@ -1049,7 +893,9 @@ function CalculadoraFinanciamientoBNH() {
                   <Input
                     type="text"
                     value={vendedorName}
-                    onChange={(e) => setVendedorName(e.target.value)}
+                    onChange={(e) =>
+                      setVendedorName(e.target.value)
+                    }
                     placeholder={
                       vendedoresLoading
                         ? "Cargando vendedores..."
@@ -1073,28 +919,35 @@ function CalculadoraFinanciamientoBNH() {
 
             <CardContent className="space-y-5">
               <div>
-                <Label className="mb-2 block">Equipo</Label>
+                <Label className="mb-2 block">
+                  Equipo
+                </Label>
 
                 <Select
                   value={selectedEquipoId}
                   onValueChange={handleEquipoChange}
-                  disabled={
-                    catalogLoading ||
-                    equipos.length === 0 ||
-                    categorias.length === 0
-                  }
+                  disabled={equiposLoading || equipos.length === 0}
                 >
-                  <SelectTrigger className="rounded-xl" style={selectFont}>
+                  <SelectTrigger
+                    className="rounded-xl"
+                    style={{
+                      fontFamily: "Verdana, sans-serif",
+                    }}
+                  >
                     <SelectValue
                       placeholder={
-                        catalogLoading
+                        equiposLoading
                           ? "Cargando equipos..."
                           : "Seleccione un equipo"
                       }
                     />
                   </SelectTrigger>
 
-                  <SelectContent style={selectFont}>
+                  <SelectContent
+                    style={{
+                      fontFamily: "Verdana, sans-serif",
+                    }}
+                  >
                     {equipos.map((equipo) => {
                       const sinPrecio =
                         equipo.precioCredito <= 0 && equipo.precioContado <= 0;
@@ -1104,7 +957,9 @@ function CalculadoraFinanciamientoBNH() {
                           key={equipo.id}
                           value={equipo.id}
                           disabled={sinPrecio}
-                          style={selectFont}
+                          style={{
+                            fontFamily: "Verdana, sans-serif",
+                          }}
                         >
                           {equipo.nombre}
                           {sinPrecio ? " — sin precio" : ""}
@@ -1115,24 +970,35 @@ function CalculadoraFinanciamientoBNH() {
                 </Select>
 
                 {equiposError ? (
-                  <p className="mt-2 text-xs text-red-600">{equiposError}</p>
+                  <p className="mt-2 text-xs text-red-600">
+                    {equiposError}
+                  </p>
                 ) : (
                   <p className="mt-2 text-xs text-gray-500">
-                    Al seleccionar un equipo se completan automáticamente la
-                    categoría y los precios de crédito y de contado; puede
-                    ajustar los precios manualmente.
+                    Al seleccionar un equipo se completan
+                    automáticamente la categoría y los precios de
+                    crédito y de contado; puede ajustar los precios
+                    manualmente.
                   </p>
                 )}
               </div>
 
               <div>
-                <Label className="mb-2 block">Categoría</Label>
+                <Label className="mb-2 block">
+                  Categoría
+                </Label>
 
                 {/* Solo lectura: la categoría se define al elegir el equipo */}
-                <Select value={category} onValueChange={() => {}} disabled>
+                <Select
+                  value={category}
+                  onValueChange={() => {}}
+                  disabled
+                >
                   <SelectTrigger
                     className="rounded-xl bg-gray-100 disabled:cursor-default disabled:opacity-100"
-                    style={selectFont}
+                    style={{
+                      fontFamily: "Verdana, sans-serif",
+                    }}
                   >
                     <SelectValue
                       placeholder={
@@ -1143,12 +1009,18 @@ function CalculadoraFinanciamientoBNH() {
                     />
                   </SelectTrigger>
 
-                  <SelectContent style={selectFont}>
+                  <SelectContent
+                    style={{
+                      fontFamily: "Verdana, sans-serif",
+                    }}
+                  >
                     {categorias.map((cat) => (
                       <SelectItem
                         key={cat.nombre}
                         value={cat.nombre}
-                        style={selectFont}
+                        style={{
+                          fontFamily: "Verdana, sans-serif",
+                        }}
                       >
                         {cat.nombre}
                       </SelectItem>
@@ -1157,32 +1029,47 @@ function CalculadoraFinanciamientoBNH() {
                 </Select>
 
                 {categoriasError && (
-                  <p className="mt-2 text-xs text-red-600">{categoriasError}</p>
+                  <p className="mt-2 text-xs text-red-600">
+                    {categoriasError}
+                  </p>
                 )}
               </div>
 
               <div>
-                <Label className="mb-2 block">Precio</Label>
+                <Label className="mb-2 block">
+                  Precio
+                </Label>
+
                 <Input
                   type="number"
                   min="0"
                   step="0.01"
                   value={basePrice}
-                  onChange={(e) => setBasePrice(e.target.value)}
+                  onChange={(e) =>
+                    setBasePrice(
+                      e.target.value
+                    )
+                  }
                   placeholder="Ej. 10000"
                   className="rounded-xl"
                 />
               </div>
 
               <div>
-                <Label className="mb-2 block">Monto inicial</Label>
+                <Label className="mb-2 block">
+                  Monto inicial
+                </Label>
 
                 <Input
                   type="number"
                   min={minInitialAmount || 0}
                   step={100}
                   value={initialAmount}
-                  onChange={(e) => setInitialAmount(e.target.value)}
+                  onChange={(e) =>
+                    setInitialAmount(
+                      e.target.value
+                    )
+                  }
                   placeholder="Ej. 5000"
                   className="rounded-xl"
                 />
@@ -1212,50 +1099,104 @@ function CalculadoraFinanciamientoBNH() {
               </div>
 
               <div>
-                <Label className="mb-2 block">Financiamiento del I.V.A.</Label>
+                <Label className="mb-2 block">
+                  Financiamiento del
+                  I.V.A.
+                </Label>
 
                 <Select
                   value={ivaFinancing}
-                  onValueChange={(value: PaymentMode) => setIvaFinancing(value)}
+                  onValueChange={(
+                    value: PaymentMode
+                  ) =>
+                    setIvaFinancing(
+                      value
+                    )
+                  }
                 >
-                  <SelectTrigger className="rounded-xl" style={selectFont}>
+                  <SelectTrigger
+                    className="rounded-xl"
+                    style={{
+                      fontFamily:
+                        "Verdana, sans-serif",
+                    }}
+                  >
                     <SelectValue placeholder="Seleccione" />
                   </SelectTrigger>
 
-                  <SelectContent style={selectFont}>
-                    <SelectItem value="si" style={selectFont}>
+                  <SelectContent
+                    style={{
+                      fontFamily:
+                        "Verdana, sans-serif",
+                    }}
+                  >
+                    <SelectItem
+                      value="si"
+                      style={{
+                        fontFamily:
+                          "Verdana, sans-serif",
+                      }}
+                    >
                       Sí
                     </SelectItem>
 
-                    <SelectItem
-                      value="no"
-                      disabled={!categoryConfig?.canPayVATSeparately}
-                      style={selectFont}
-                    >
-                      No
-                    </SelectItem>
+                    {categoryConfig?.canPayVATSeparately ? (
+                      <SelectItem
+                        value="no"
+                        style={{
+                          fontFamily:
+                            "Verdana, sans-serif",
+                        }}
+                      >
+                        No
+                      </SelectItem>
+                    ) : (
+                      <SelectItem
+                        value="no"
+                        disabled
+                        style={{
+                          fontFamily:
+                            "Verdana, sans-serif",
+                        }}
+                      >
+                        No
+                      </SelectItem>
+                    )}
                   </SelectContent>
                 </Select>
               </div>
 
               <div>
-                <Label className="mb-2 block">Cantidad de cuotas</Label>
+                <Label className="mb-2 block">
+                  Cantidad de cuotas
+                </Label>
 
                 <Select
                   value={installments}
                   onValueChange={setInstallments}
                   disabled={!categoryConfig || categoryConfig.terms.length === 0}
                 >
-                  <SelectTrigger className="rounded-xl" style={selectFont}>
+                  <SelectTrigger
+                    className="rounded-xl"
+                    style={{
+                      fontFamily: "Verdana, sans-serif",
+                    }}
+                  >
                     <SelectValue placeholder="Seleccione el plazo" />
                   </SelectTrigger>
 
-                  <SelectContent style={selectFont}>
+                  <SelectContent
+                    style={{
+                      fontFamily: "Verdana, sans-serif",
+                    }}
+                  >
                     {(categoryConfig?.terms ?? []).map((term) => (
                       <SelectItem
                         key={term.meses}
                         value={String(term.meses)}
-                        style={selectFont}
+                        style={{
+                          fontFamily: "Verdana, sans-serif",
+                        }}
                       >
                         {term.meses} cuotas
                       </SelectItem>
@@ -1272,13 +1213,27 @@ function CalculadoraFinanciamientoBNH() {
                 </p>
               </div>
 
-              {validations.length > 0 && (
+              {validations.length >
+                0 && (
                 <Alert className="border-red-200 bg-red-50">
                   <AlertDescription>
                     <div className="space-y-1">
-                      {validations.map((message, index) => (
-                        <div key={index}>{message}</div>
-                      ))}
+                      {validations.map(
+                        (
+                          message,
+                          index
+                        ) => (
+                          <div
+                            key={
+                              index
+                            }
+                          >
+                            {
+                              message
+                            }
+                          </div>
+                        )
+                      )}
                     </div>
                   </AlertDescription>
                 </Alert>
@@ -1286,7 +1241,9 @@ function CalculadoraFinanciamientoBNH() {
 
               <Button
                 variant="outline"
-                onClick={handleReset}
+                onClick={
+                  handleReset
+                }
                 className="rounded-xl border-gray-300"
               >
                 Restablecer
@@ -1309,7 +1266,7 @@ function CalculadoraFinanciamientoBNH() {
                     Aplicar Ajuste
                   </p>
                   <p className="text-xs text-gray-500">
-                    Usa el I.V.A. ajustado del equipo seleccionado
+                    
                   </p>
                 </div>
 
@@ -1339,8 +1296,8 @@ function CalculadoraFinanciamientoBNH() {
                 <Alert className="mb-4 border-amber-200 bg-amber-50">
                   <AlertDescription>
                     {selectedEquipoId
-                      ? "Este equipo no tiene I.V.A. ajustado; se usa el I.V.A. normal."
-                      : "Seleccione un equipo de la lista para aplicar su I.V.A. ajustado; mientras tanto se usa el I.V.A. normal."}
+                      ? "El I.V.A. normal."
+                      : "Seleccione un equipo de la lista para aplicar su I.V.A. ; mientras tanto se usa el I.V.A. normal."}
                   </AlertDescription>
                 </Alert>
               )}
@@ -1357,7 +1314,10 @@ function CalculadoraFinanciamientoBNH() {
                     value={formatCurrency(contadoMonto)}
                   />
 
-                  <Item label="I.V.A." value={formatCurrency(contadoIva)} />
+                  <Item
+                    label="I.V.A."
+                    value={formatCurrency(contadoIva)}
+                  />
                 </div>
 
                 <TotalBox title="Total a pagar" total={contadoTotal} />
@@ -1413,26 +1373,14 @@ function CalculadoraFinanciamientoBNH() {
 
                   <Item
                     label="Total a pagar"
-                    value={formatCurrency(isValid ? calculations.totalToPay : 0)}
+                    value={formatCurrency(calculations.totalToPay)}
                   />
                 </div>
 
                 <TotalBox
                   title="Total crédito a pagar"
-                  total={isValid ? calculations.totalToPay : 0}
+                  total={calculations.totalToPay}
                 />
-
-                {SHOW_AIRR_CONTROL &&
-                  isValid &&
-                  calculations.airrResultante !== null &&
-                  calculations.airrObjetivo !== null && (
-                    <p className="mt-3 text-xs text-gray-400">
-                      Control interno · AIRR objetivo{" "}
-                      {(calculations.airrObjetivo * 100).toFixed(2)}% · AIRR
-                      resultante{" "}
-                      {(calculations.airrResultante * 100).toFixed(2)}%
-                    </p>
-                  )}
               </div>
 
               <Button
@@ -1454,20 +1402,26 @@ function CalculadoraFinanciamientoBNH() {
               </Button>
 
               <p className="mt-2 text-xs text-gray-500">
-                Se generará el PDF de la cotización y se enviará por correo al
-                lead (y al vendedor, si su correo está registrado en la hoja
-                &quot;VENDEDORES&quot;); quedará guardada en el Funel de Venta.
+                Se generará el PDF de la cotización y se
+                enviará por correo al lead (y al vendedor, si
+                su correo está registrado en la hoja
+                &quot;VENDEDORES&quot;); quedará guardada en
+                el Funel de Venta.
               </p>
 
               {sendQuoteError && (
                 <Alert className="mt-4 border-red-200 bg-red-50">
-                  <AlertDescription>{sendQuoteError}</AlertDescription>
+                  <AlertDescription>
+                    {sendQuoteError}
+                  </AlertDescription>
                 </Alert>
               )}
 
               {sendQuoteSuccess && (
                 <Alert className="mt-4 border-green-200 bg-green-50">
-                  <AlertDescription>{sendQuoteSuccess}</AlertDescription>
+                  <AlertDescription>
+                    {sendQuoteSuccess}
+                  </AlertDescription>
                 </Alert>
               )}
             </CardContent>
@@ -1478,17 +1432,33 @@ function CalculadoraFinanciamientoBNH() {
   );
 }
 
-function Item({ label, value }: { label: string; value: string }) {
+function Item({
+  label,
+  value,
+}: {
+  label: string;
+  value: string;
+}) {
   return (
     <div className="rounded-2xl border border-gray-200 bg-white p-4 shadow-sm">
-      <p className="text-gray-500">{label}</p>
+      <p className="text-gray-500">
+        {label}
+      </p>
 
-      <p className="mt-1 font-semibold text-gray-900">{value}</p>
+      <p className="mt-1 font-semibold text-gray-900">
+        {value}
+      </p>
     </div>
   );
 }
 
-function TotalBox({ title, total }: { title: string; total: number }) {
+function TotalBox({
+  title,
+  total,
+}: {
+  title: string;
+  total: number;
+}) {
   return (
     <div className="mt-4 rounded-2xl border border-[#0d6f91]/30 bg-[#0d6f91]/10 p-4">
       <p className="text-sm font-medium text-[#0d6f91]">{title}</p>
