@@ -1,7 +1,6 @@
-// Evalúa las fórmulas de la hoja "CATEGORIA" tal cual están escritas, por ejemplo:
+// Evalúa la fórmula de la hoja "CATEGORIA" tal cual está escrita, por ejemplo:
 //   REDONDEAR.MAS(( Precio/1,03)* 0.25; -2)
-//   CEILING(((Precio / 1.03) - Inicial) * PMT(0.029, Cuotas, -1), 10)
-// Solo admite números, "Precio", "Inicial", "Cuotas", PMT, + - * / y paréntesis (no ejecuta código).
+// Solo admite números, "Precio", + - * / y paréntesis (no ejecuta código).
 
 function parseNumberOrExpression(expr: string): number | null {
   const src = expr.replace(/\s+/g, "");
@@ -105,100 +104,201 @@ export function evaluateInitialFormula(
   return Math.ceil(value * factor - 1e-9) / factor;
 }
 
-function toNum(s: string): number {
-  return Number(s.trim().replace(",", "."));
+/**
+ * Evalúa la fórmula de cuota mensual de la hoja "CATEGORIA", tal cual está escrita.
+ * Ejemplos soportados:
+ *   CEILING(PMT((1+0.3)^(1/12)-1, 12, -(Precio-Inicial)), 5)
+ *   CEILING(((Precio / 1.03) - Inicial) *1.20 / Cuotas, 10)
+ * Variables: Precio, Inicial, Cuotas, IVA. Funciones: CEILING/TECHO/MULTIPLO.SUPERIOR,
+ * PMT/PAGO, ROUNDUP/REDONDEAR.MAS. Operadores: + - * / ^ % y paréntesis.
+ * Separador de argumentos: "," o ";" (con ";" la coma es decimal).
+ * No ejecuta código: solo un parser aritmético propio. Devuelve null si no se puede interpretar.
+ */
+export type InstallmentVars = {
+  precio: number;
+  inicial: number;
+  cuotas: number;
+  iva?: number;
+};
+
+/** ¿La fórmula menciona la variable IVA? (entonces la fórmula decide cómo se suma) */
+export function formulaUsesIva(formula: string | null | undefined): boolean {
+  return !!formula && /\biva\b/i.test(formula);
 }
 
-/**
- * Reemplaza cada PMT(tasa, nper, va) por su valor numérico (igual que Google Sheets):
- *   PMT = -va * r / (1 - (1 + r)^-n)     (con va = -1 da la cuota por cada $1 financiado)
- * "nper" puede ser la palabra Cuotas. Devuelve null si algún PMT no se puede interpretar.
- */
-function replacePmt(expr: string, cuotas: number): string | null {
-  let failed = false;
-
-  const out = expr.replace(
-    /(?:pmt|pago)\s*\(\s*([^,;()]+?)\s*[,;]\s*([^,;()]+?)\s*[,;]\s*([^,;()]+?)\s*\)/gi,
-    (_m, rateS: string, nS: string, pvS: string) => {
-      const rate = toNum(rateS);
-      const n = /^cuotas$/i.test(nS.trim()) ? cuotas : toNum(nS);
-      const pv = toNum(pvS);
-
-      if (![rate, n, pv].every(Number.isFinite) || n <= 0) {
-        failed = true;
-        return "0";
-      }
-
-      const pmt =
-        rate === 0 ? -pv / n : (-pv * rate) / (1 - Math.pow(1 + rate, -n));
-
-      if (!Number.isFinite(pmt)) {
-        failed = true;
-        return "0";
-      }
-      return `(${pmt.toFixed(12)})`;
-    }
-  );
-
-  return failed ? null : out;
+/** ¿La fórmula divide el precio entre 1,03 (base neta)? */
+export function formulaUsesNetBase(formula: string | null | undefined): boolean {
+  return !!formula && /\/\s*\(?\s*1[.,]03\b/.test(formula);
 }
 
-/**
- * Evalúa la fórmula de la cuota mensual de la hoja "CATEGORIA", tal cual, por ejemplo:
- *   CEILING(((Precio / 1.03) - Inicial) * 1.20 / Cuotas, 10)
- *   CEILING(((Precio / 1.03) - Inicial) * PMT(0.029, Cuotas, -1), 10)
- * "Precio", "Inicial" y "Cuotas" se reemplazan por sus valores. El último argumento es el
- * múltiplo al que se redondea hacia arriba. También acepta TECHO / MULTIPLO.SUPERIOR y ";"
- * como separador. Devuelve null si no se puede interpretar.
- */
+class FormulaError extends Error {}
+
 export function evaluateInstallmentFormula(
   formula: string | null | undefined,
-  vars: { precio: number; inicial: number; cuotas: number }
+  vars: InstallmentVars
 ): number | null {
   if (!formula) return null;
   const { precio, inicial, cuotas } = vars;
-  if (![precio, inicial, cuotas].every(Number.isFinite) || cuotas <= 0) {
+  const iva = vars.iva ?? 0;
+  if (![precio, inicial, cuotas, iva].every(Number.isFinite) || cuotas <= 0) {
     return null;
   }
 
-  const call =
-    /^\s*=?\s*(?:ceiling|techo|multiplo\.superior)\s*\(([\s\S]*)\)\s*$/i.exec(
-      formula
-    );
-  if (!call) return null;
-
-  const inner = call[1];
-
-  let exprPart: string;
-  let stepPart: string;
-  const semi = inner.lastIndexOf(";");
-  if (semi !== -1) {
-    exprPart = inner.slice(0, semi);
-    stepPart = inner.slice(semi + 1);
-  } else {
-    const m = /^([\s\S]*),\s*(\d+(?:[.,]\d+)?)\s*$/.exec(inner);
-    if (!m) return null;
-    exprPart = m[1];
-    stepPart = m[2];
+  let src = formula.trim().replace(/^=\s*/, "");
+  if (src.includes(";")) {
+    src = src.replace(/(\d),(\d)/g, "$1.$2").replace(/;/g, ",");
   }
 
-  const step = toNum(stepPart);
-  if (!Number.isFinite(step) || step <= 0) return null;
+  let pos = 0;
+  const skip = () => {
+    while (pos < src.length && /\s/.test(src[pos])) pos++;
+  };
+  const peek = () => {
+    skip();
+    return src[pos];
+  };
+  const eat = (ch: string) => {
+    if (peek() !== ch) throw new FormulaError(`se esperaba "${ch}"`);
+    pos++;
+  };
 
-  // 1) PMT primero (antes de tocar comas decimales y variables)
-  const withoutPmt = replacePmt(exprPart, cuotas);
-  if (withoutPmt === null) return null;
+  const variables: Record<string, number> = {
+    precio,
+    inicial,
+    cuotas,
+    iva,
+  };
 
-  // 2) Variables y coma decimal
-  const withVars = withoutPmt
-    .replace(/precio/gi, `(${precio})`)
-    .replace(/inicial/gi, `(${inicial})`)
-    .replace(/cuotas/gi, `(${cuotas})`)
-    .replace(/(\d),(\d)/g, "$1.$2");
+  function pmt(args: number[]): number {
+    const [rate, nper, pv, fv = 0, type = 0] = args;
+    if (args.length < 3 || nper <= 0) throw new FormulaError("PMT inválido");
+    if (rate === 0) return -(pv + fv) / nper;
+    const g = Math.pow(1 + rate, nper);
+    return -((pv * g + fv) * rate) / ((1 + rate * type) * (g - 1));
+  }
 
-  const value = parseNumberOrExpression(withVars);
-  if (value === null || value <= 0) return null;
+  const functions: Record<string, (a: number[]) => number> = {
+    ceiling: (a) => {
+      const [x, step] = a;
+      if (!(step > 0)) throw new FormulaError("paso inválido");
+      return Math.ceil(x / step - 1e-9) * step;
+    },
+    roundup: (a) => {
+      const [x, digits] = a;
+      const f = Math.pow(10, digits);
+      return Math.ceil(x * f - 1e-9) / f;
+    },
+    pmt,
+  };
+  functions["techo"] = functions.ceiling;
+  functions["multiplo.superior"] = functions.ceiling;
+  functions["redondear.mas"] = functions.roundup;
+  functions["pago"] = pmt;
 
-  // CEILING(valor; paso): redondeo hacia arriba al múltiplo de "paso"
-  return Math.ceil(value / step - 1e-9) * step;
+  function parseExpr(): number {
+    let left = parseTerm();
+    for (;;) {
+      const c = peek();
+      if (c !== "+" && c !== "-") return left;
+      pos++;
+      const right = parseTerm();
+      left = c === "+" ? left + right : left - right;
+    }
+  }
+
+  function parseTerm(): number {
+    let left = parseUnary();
+    for (;;) {
+      const c = peek();
+      if (c !== "*" && c !== "/") return left;
+      pos++;
+      const right = parseUnary();
+      if (c === "/" && right === 0) throw new FormulaError("división por cero");
+      left = c === "*" ? left * right : left / right;
+    }
+  }
+
+  function parseUnary(): number {
+    const c = peek();
+    if (c === "-") {
+      pos++;
+      return -parseUnary();
+    }
+    if (c === "+") {
+      pos++;
+      return parseUnary();
+    }
+    return parsePower();
+  }
+
+  function parsePower(): number {
+    let base = parsePostfix();
+    while (peek() === "^") {
+      pos++;
+      base = Math.pow(base, parsePostfix());
+    }
+    return base;
+  }
+
+  function parsePostfix(): number {
+    let v = parsePrimary();
+    while (peek() === "%") {
+      pos++;
+      v = v / 100;
+    }
+    return v;
+  }
+
+  function parsePrimary(): number {
+    const c = peek();
+    if (c === "(") {
+      pos++;
+      const v = parseExpr();
+      eat(")");
+      return v;
+    }
+
+    const rest = src.slice(pos);
+    const num = /^(\d+(\.\d+)?|\.\d+)/.exec(rest);
+    if (num) {
+      pos += num[0].length;
+      return Number(num[0]);
+    }
+
+    const id = /^[A-Za-z_][A-Za-z0-9_.]*/.exec(rest);
+    if (!id) throw new FormulaError("token inesperado");
+    pos += id[0].length;
+    const name = id[0].toLowerCase();
+
+    if (peek() === "(") {
+      const fn = functions[name];
+      if (!fn) throw new FormulaError(`función no soportada: ${name}`);
+      pos++;
+      const args: number[] = [];
+      if (peek() !== ")") {
+        for (;;) {
+          args.push(parseExpr());
+          if (peek() === ",") {
+            pos++;
+            continue;
+          }
+          break;
+        }
+      }
+      eat(")");
+      return fn(args);
+    }
+
+    if (name in variables) return variables[name];
+    throw new FormulaError(`variable desconocida: ${name}`);
+  }
+
+  try {
+    const value = parseExpr();
+    skip();
+    if (pos !== src.length) return null;
+    return Number.isFinite(value) && value > 0 ? value : null;
+  } catch {
+    return null;
+  }
 }
