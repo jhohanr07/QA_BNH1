@@ -74,7 +74,7 @@ function formatCurrency(value: number) {
 
 function roundUpToNearest5(value: number) {
   if (!Number.isFinite(value) || value <= 0) return 0;
-  return Math.ceil(value / 5) * 10;
+  return Math.ceil(value / 5) * 5;
 }
 
 function roundUpToMultiple(value: number, step: number) {
