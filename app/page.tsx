@@ -47,6 +47,10 @@ const SHOW_AIRR_CONTROL: boolean = false;
 // Categorías (nombre normalizado) que no permiten pagar el I.V.A. por separado
 const CATEGORIES_WITHOUT_SEPARATE_VAT = ["teair"];
 
+// false = el I.V.A. del cálculo de la cuota es (precio/1,03) x 16 %, igual que la versión vieja.
+// true  = usa el "IVA ajustado" de la columna G también para calcular la cuota.
+const USAR_IVA_AJUSTADO_EN_CUOTA = false;
+
 // Paso de redondeo de la inicial solo cuando la hoja no trae una fórmula utilizable
 const INITIAL_STEP = 500;
 
@@ -454,11 +458,11 @@ function CalculadoraFinanciamientoBNH() {
   //  - Financiamiento del I.V.A. = Sí  -> se suma al monto financiado (y "I.V.A. a pagar en Bs" = 0)
   //  - Financiamiento del I.V.A. = No  -> se paga aparte: "I.V.A. a pagar en Bs" = I.V.A. ajustado
   const ivaCredito =
-    safeBaseForRules > 0
-      ? ivaAjustadoDisponible
-        ? ivaAjustadoLista
-        : vatAmount
-      : 0;
+  safeBaseForRules > 0
+    ? USAR_IVA_AJUSTADO_EN_CUOTA && ivaAjustadoDisponible
+      ? ivaAjustadoLista
+      : vatAmount
+    : 0;
 
   const contadoIva =
     contadoMonto > 0 ? (usaAjuste ? ivaAjustadoLista : contadoIvaNormal) : 0;
@@ -626,10 +630,10 @@ function CalculadoraFinanciamientoBNH() {
         ? (1 - Math.pow(1 + r, -safeInstallments)) / r
         : safeInstallments;
 
-    // 2) Lo que la empresa adelanta en el mes 0
-    //    IVA financiado (Sí): IGTF sobre base + IVA  -> se suma IVA x 3%
-    //    IVA aparte (No):     IGTF solo sobre la base (ya incluido en el precio)
-    const igtfSobreIva = ivaFinancing === "si" ? ivaCredito * IGTF_RATE : 0;
+    // 2) Lo que la empresa adelanta en el mes 0 (igual que la versión vieja):
+    //    el IGTF del 3 % siempre se calcula también sobre el I.V.A.,
+    //    se financie o no el I.V.A.
+    const igtfSobreIva = ivaCredito * IGTF_RATE;
     const montoMes0 = safeBase - safeInitial + ivaCredito + igtfSobreIva;
 
     // 3) Cuota sin redondear según cómo se paga el IVA
@@ -640,9 +644,10 @@ function CalculadoraFinanciamientoBNH() {
 
     const roundedMonthlyPayment = roundUpToNearest5(rawPayment);
 
-    // Monto financiado que se muestra en pantalla
+    // Monto financiado que se muestra en pantalla (con "No", el I.V.A. y su IGTF van aparte)
+    const igtfFinanciado = ivaFinancing === "si" ? igtfSobreIva : 0;
     const financedAmount =
-      safeBase - safeInitial + ivaFinanced + igtfSobreIva;
+      safeBase - safeInitial + ivaFinanced + igtfFinanciado;
 
     // 4) Control: AIRR resultante con la cuota ya redondeada
     let airrResultante: number | null = null;
