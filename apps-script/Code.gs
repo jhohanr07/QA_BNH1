@@ -4,8 +4,9 @@
  * Backend en Google Apps Script, vinculado al Google Sheet que actúa
  * como base de datos de la calculadora.
  *
- * Hoja CATEGORIA: cada columna de plazo (12, 15, 18) trae SOLO el AIRR
- * objetivo (ej. 25% o 0.25). La cuota se calcula en el front (page.tsx).
+ *     QAQAQAQAQAQAQAQAQAQAQQQQQQAQAAQA 
+ *
+ *     proyecto Next.js (Vercel).
  */
 
 var SHEET_PRECIOS = "PRECIO EQUIPOS";
@@ -141,18 +142,23 @@ function getEquipos_() {
 
 /**
  * Lee la hoja "CATEGORIA" y devuelve una entrada por categoría (columna A,
- * valores únicos) con su inicial mínima/sugerida y el AIRR objetivo por plazo:
- *   plazos: [{ meses: 12, airr: 0.25 }, ...]
+ * valores únicos) con sus condiciones de financiamiento ya interpretadas.
  */
 function getCategorias_() {
   var sheet = getSheet_(SHEET_CATEGORIA);
   var values = sheet.getDataRange().getValues();
-
   if (values.length < 2) return [];
 
-  var headers = values[0].map(function (h) {
-    return String(h).trim();
-  });
+  // Fila de encabezados = primera fila (de las 10 primeras) que tenga una celda "Categoria".
+  var hr = -1;
+  for (var r = 0; r < Math.min(values.length, 10) && hr === -1; r++) {
+    for (var k = 0; k < values[r].length; k++) {
+      if (normalizeName_(values[r][k]) === "categoria") { hr = r; break; }
+    }
+  }
+  if (hr === -1) hr = 0;
+
+  var headers = values[hr].map(function (h) { return String(h).trim(); });
   var norm = headers.map(normalizeName_);
 
   var idxCat = norm.indexOf("categoria");
@@ -160,70 +166,99 @@ function getCategorias_() {
   var idxMin = norm.indexOf("inicial minima");
   var idxSug = norm.indexOf("inicial sugerida");
 
-  // Columnas de plazo: cualquier encabezado con un número de meses/cuotas
-  // ("12", "12 Cuotas", "15 cuotas", "18 meses", "Cuotas 18", "Plazo 18").
+  // Las columnas desde "AIRR" en adelante son datos auxiliares, no plazos.
+  var endCol = norm.indexOf("airr");
+  if (endCol === -1) endCol = headers.length;
+
+  // Etiqueta de bloque en la fila de arriba ("IVA FINANCIADO SI" / "IVA FINANCIADO NO"),
+  // se arrastra hacia la derecha hasta la siguiente etiqueta.
+  var groupRow = hr > 0 ? values[hr - 1] : [];
+  var mode = "ambos";
   var termCols = [];
   var usados = {};
-  for (var c = 0; c < headers.length; c++) {
+  for (var c = 0; c < endCol; c++) {
+    var g = normalizeName_(groupRow[c]);
+    if (g) {
+      if (/\bno\b/.test(g)) mode = "no";
+      else if (/\bsi\b/.test(g)) mode = "si";
+      else mode = "ambos";
+    }
     if (c === idxCat || c === idxMin || c === idxSug) continue;
     var meses = parseTermHeader_(norm[c]);
-    if (meses === null || usados[meses]) continue;
-    usados[meses] = true;
-    termCols.push({ col: c, meses: meses });
+    if (meses === null) continue;
+    var key = meses + "|" + mode;
+    if (usados[key]) continue;
+    usados[key] = true;
+    termCols.push({ col: c, meses: meses, mode: mode });
   }
 
   if (termCols.length === 0) {
     throw new Error(
-      'La hoja "' + SHEET_CATEGORIA + '" no tiene columnas de plazo reconocibles ' +
-      '(ej. "12 Cuotas", "15 Cuotas", "18 Cuotas"). Encabezados leídos: ' + headers.join(" | ")
+      'La hoja "' + SHEET_CATEGORIA + '" no tiene columnas de plazo reconocibles. Encabezados leídos: ' +
+      headers.join(" | ")
     );
   }
 
   var byKey = {};
   var order = [];
 
-  for (var i = 1; i < values.length; i++) {
+  for (var i = hr + 1; i < values.length; i++) {
     var row = values[i];
     var nombre = String(row[idxCat] || "").trim();
     if (!nombre) continue;
 
-    var key = normalizeName_(nombre);
-    if (!byKey[key]) {
-      byKey[key] = {
-        nombre: nombre,
-        inicialMinima: null,
-        inicialSugerida: null,
-        plazos: [],
-      };
-      order.push(key);
+    var ck = normalizeName_(nombre);
+    if (!byKey[ck]) {
+      byKey[ck] = { nombre: nombre, inicialMinima: null, inicialSugerida: null, plazosSi: [], plazosNo: [] };
+      order.push(ck);
     }
-    var cat = byKey[key];
+    var cat = byKey[ck];
 
-    // Si la categoría se repite en varias filas, se toma la primera regla interpretable.
     if (!cat.inicialMinima && idxMin !== -1) cat.inicialMinima = parseInitialRule_(row[idxMin]);
     if (!cat.inicialSugerida && idxSug !== -1) cat.inicialSugerida = parseInitialRule_(row[idxSug]);
 
     for (var t = 0; t < termCols.length; t++) {
-      var mesesPlazo = termCols[t].meses;
-      var yaExiste = cat.plazos.some(function (p) { return p.meses === mesesPlazo; });
-      if (yaExiste) continue;
+      var tc = termCols[t];
+      var resolved = resolveCellRefs_(row[tc.col], values);
+      var rate = parseTermRate_(resolved, tc.meses);
+      if (!rate) continue;
 
-      // Solo el AIRR objetivo; vacío o "Sin calculo" = el plazo no se ofrece.
-      var airr = parseAirr_(row[termCols[t].col]);
-      if (airr !== null) {
-        cat.plazos.push({ meses: mesesPlazo, airr: airr });
-      }
+      var plazo = { meses: tc.meses, formula: rate.formula, factor: rate.factor, tasaMensual: rate.tasaMensual };
+      if (tc.mode === "si" || tc.mode === "ambos") cat.plazosSi.push(plazo);
+      if (tc.mode === "no" || tc.mode === "ambos") cat.plazosNo.push(plazo);
     }
   }
 
-  // Se descartan filas sin ningún plazo con AIRR (ej. notas o textos sueltos en la columna A).
-  return order
-    .map(function (k) {
-      var cat = byKey[k];
-      cat.plazos.sort(function (a, b) { return a.meses - b.meses; });
-      return cat;
-    })
-    .filter(function (cat) { return cat.plazos.length > 0; });
+  return order.map(function (k) {
+    var cat = byKey[k];
+    cat.plazosSi.sort(function (a, b) { return a.meses - b.meses; });
+    cat.plazosNo.sort(function (a, b) { return a.meses - b.meses; });
+    return cat;
+  });
+}
+
+/** Convierte "L" -> 11, "AA" -> 26 (índice base 0). */
+function colLetterToIndex_(letters) {
+  var n = 0;
+  for (var i = 0; i < letters.length; i++) n = n * 26 + (letters.charCodeAt(i) - 64);
+  return n - 1;
+}
+
+/**
+ * Reemplaza referencias de celda ($L3, $L$2, M3...) por su valor numérico.
+ * Si alguna apunta a algo no numérico ("Sin calculo", vacío), devuelve "Sin calculo".
+ */
+function resolveCellRefs_(cell, values) {
+  if (typeof cell !== "string") return cell;
+  var ok = true;
+  var out = cell.replace(/(^|[^A-Za-z0-9_.])\$?([A-Z]{1,3})\$?(\d+)(?![\d(A-Za-z_])/g,
+    function (m, pre, col, rowN) {
+      var v = (values[Number(rowN) - 1] || [])[colLetterToIndex_(col)];
+      if (typeof v === "number" && isFinite(v)) return pre + "(" + v + ")";
+      ok = false;
+      return m;
+    });
+  return ok ? out : "Sin calculo";
 }
 
 /**
@@ -285,34 +320,60 @@ function parseInitialRule_(cell) {
 }
 
 /**
- * Lee el AIRR objetivo de la celda de un plazo y lo devuelve como fracción anual
- * (0.25 = 25%). Acepta:
- *   - número de Sheets formateado como %  -> 0.25  (se deja igual)
- *   - número entero tipo porcentaje       -> 25    (se convierte a 0.25)
- *   - texto "25%", "25 %", "25", "0,25"
- * Devuelve null si la celda está vacía, dice "Sin calculo" o no es interpretable
- * (ese plazo no se ofrece).
+ * Interpreta la celda de un plazo. Devuelve { formula, factor, tasaMensual } o null si
+ * el plazo no está disponible ("Sin calculo" / vacío / no interpretable).
+ *
+ *  - Fórmula de cuota (formato actual):
+ *      "CEILING(((Precio / 1.03) - Inicial) *1.20 / Cuotas, 10)"
+ *    -> { formula: <texto tal cual>, factor: 1.20, tasaMensual: null }
+ *    (el front evalúa la fórmula; "factor" es solo respaldo y etiqueta).
+ *  - Formato anterior: "=(1.30 ^ (1 / 18))" -> { formula: null, factor: 1.30, tasaMensual: 1.30^(1/18) - 1 }
  */
-function parseAirr_(cell) {
+function parseTermRate_(cell, meses) {
   if (cell === "" || cell === null || cell === undefined) return null;
 
-  var n;
-  if (typeof cell === "number") {
-    n = cell;
-  } else {
+  if (typeof cell !== "number") {
     var raw = String(cell).trim();
     if (!raw || /sin\s*c[aá]lculo/i.test(raw)) return null;
 
-    var hasPct = /%/.test(raw);
-    n = parseFloat(raw.replace("%", "").replace(/\s+/g, "").replace(",", "."));
-    if (!isFinite(n)) return null;
-    if (hasPct) n = n / 100;
+    if (/^=?\s*(ceiling|techo|multiplo\.superior)\s*\(/i.test(raw)) {
+      return { formula: raw.replace(/^=\s*/, ""), factor: extractMultiplier_(raw), tasaMensual: null };
+    }
   }
 
-  if (!isFinite(n) || n <= 0) return null;
-  if (n >= 1) n = n / 100; // 25 -> 0.25
-  if (n <= 0 || n >= 1) return null;
-  return n;
+  var factor = null;
+
+  if (typeof cell === "number") {
+    if (cell > 0 && cell < 1) factor = 1 + cell;       // 0.30 -> 1.30
+    else if (cell > 1 && cell < 3) factor = cell;      // 1.30
+  } else {
+    var text = String(cell);
+
+    var m = text.match(/\(\s*(\d+(?:[.,]\d+)?)\s*\^/);
+    if (m) {
+      factor = parseFloat(m[1].replace(",", "."));
+    } else {
+      var mm = text.match(/(\d+(?:[.,]\d+)?)\s*%\s*mensual/i);
+      if (mm) {
+        var monthly = parseFloat(mm[1].replace(",", ".")) / 100;
+        factor = Math.pow(1 + monthly, meses);
+      }
+    }
+  }
+
+  if (!factor || !isFinite(factor) || factor <= 1 || factor >= 3) return null;
+  return { formula: null, factor: factor, tasaMensual: Math.pow(factor, 1 / meses) - 1 };
+}
+
+/** Primer multiplicador entre 1 y 3 que sigue a un "*" en la fórmula (ej. "*1.20" -> 1.2). */
+function extractMultiplier_(text) {
+  var re = /\*\s*(\d+(?:[.,]\d+)?)/g;
+  var m;
+  while ((m = re.exec(text)) !== null) {
+    var v = parseFloat(m[1].replace(",", "."));
+    if (isFinite(v) && v > 1 && v < 3) return v;
+  }
+  return null;
 }
 
 /** Número desde una celda (acepta números y textos como "$12.855,00"). */
@@ -816,6 +877,7 @@ function appendConditions_(body) {
   var lines = [
     "Vigencia de la cotización: 7 días naturales.",
     "Incluye: Garantía, instalación y capacitación (según equipo).",
+    
   ];
 
   for (var i = 0; i < lines.length; i++) {
