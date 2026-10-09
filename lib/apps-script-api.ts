@@ -17,7 +17,21 @@ export type Equipo = {
   baseAjustada: number;
   ivaAjustado: number;
 };
+export type PlazoAirr = {
+  meses: number;
+  // AIRR anual objetivo como fracción (0.25 = 25%)
+  tasa: number;
+};
 
+export type CategoriaFinanciamiento = {
+  nombre: string;
+  inicialMinima: ReglaInicial | null;
+  inicialSugerida: ReglaInicial | null;
+  plazosSi: PlazoCategoria[];
+  plazosNo: PlazoCategoria[];
+  // Plazos disponibles con su AIRR (hoja CATEGORIA, columnas L:N)
+  airr?: PlazoAirr[];
+};
 export type PlazoCategoria = {
   meses: number;
   // Fórmula de la cuota tal cual está en la hoja, ej.
