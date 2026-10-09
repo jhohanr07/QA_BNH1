@@ -19,14 +19,8 @@ export type Equipo = {
 };
 
 export type PlazoCategoria = {
-  meses: number;
-  // Fórmula de la cuota tal cual está en la hoja, ej.
-  // "CEILING(((Precio / 1.03) - Inicial) *1.20 / Cuotas, 10)". null = formato anterior (tasa).
-  formula: string | null;
-  // Multiplicador del plazo (ej. 1.20); respaldo si la fórmula no se puede evaluar
-  factor: number | null;
-  // Solo formato anterior "=(1.30 ^ (1 / 18))": factor^(1/meses) - 1. null con la fórmula nueva.
-  tasaMensual: number | null;
+  meses: number; // 12, 15, 18
+  airr: number; // AIRR objetivo anual: 0.20, 0.25, 0.30
 };
 
 export type ReglaInicial = {
@@ -114,8 +108,8 @@ export async function fetchEquipos(): Promise<Equipo[]> {
 }
 
 /**
- * Obtiene las categorías y sus condiciones (inicial mínima/sugerida y tasas por
- * plazo) desde la hoja "CATEGORIA". La columna A alimenta el desplegable.
+ * Obtiene las categorías y sus condiciones (inicial mínima/sugerida y AIRR
+ * objetivo por plazo) desde la hoja "CATEGORIA". La columna A alimenta el desplegable.
  */
 export async function fetchCategorias(): Promise<CategoriaFinanciamiento[]> {
   const baseUrl = getAppsScriptUrl();
