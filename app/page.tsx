@@ -823,7 +823,6 @@ function CalculadoraFinanciamientoBNH() {
       airrObjetivo: term.airr as number | null,
     };
    
-    };
   }, [
     safeBaseForRules,
     numericInitial,
