@@ -52,15 +52,7 @@ export type ReglaInicial = {
   digitos: number | null;
 };
 
-  export type CategoriaFinanciamiento = {
-  nombre: string;
-  inicialMinima: ReglaInicial | null;
-  inicialSugerida: ReglaInicial | null;
-  plazosSi: PlazoCategoria[]; // I.V.A. financiado = Sí (columnas D:F)
-  plazosNo: PlazoCategoria[]; // I.V.A. financiado = No (columnas G:I)
-};
-
-export type QuotePayload = {
+ export type QuotePayload = {
   leadName: string;
   leadPhone: string;
   leadEmail: string;
