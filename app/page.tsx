@@ -40,7 +40,7 @@ const CATEGORIES_WITHOUT_SEPARATE_VAT = ["teair"];
 const INITIAL_STEP = 500;
 
 // El precio del equipo YA incluye el 3 % de IGTF:
-// base = precio / 1,03  ->  I.V.A. = (precio / 1,03) x 16 %
+// base imponible = precio / 1,03  ->  I.V.A. = (precio / 1,03) x 16 %
 const CONTADO_DIVISOR = 1.03;
 const IGTF_RATE = CONTADO_DIVISOR - 1;
 
@@ -593,42 +593,43 @@ function CalculadoraFinanciamientoBNH() {
   const numericInstallments = Number(installments);
   const numericContado = Number(contadoPriceInput);
 
+  // Precio de crédito (YA incluye el 3 % de IGTF)
   const safeBaseForRules =
     Number.isFinite(numericBase) && numericBase > 0 ? numericBase : 0;
 
-  // Inicial mínima y sugerida: fórmula de la hoja CATEGORIA tal cual
+  // Base imponible = precio / 1,03 (igual que la "base imponible" de la versión vieja)
+  const baseImponible = safeBaseForRules / CONTADO_DIVISOR;
+
+  // Inicial mínima y sugerida: fórmula de la hoja CATEGORIA sobre la base imponible
   const minInitialAmount = useMemo(() => {
-    if (!categoryConfig || safeBaseForRules <= 0) return 0;
+    if (!categoryConfig || baseImponible <= 0) return 0;
     return (
+      // La fórmula de la hoja ya divide entre 1,03: se le pasa el PRECIO
       evaluateInitialFormula(categoryConfig.minFormula, safeBaseForRules) ??
       roundUpByRule(
-        safeBaseForRules * categoryConfig.minInitialRate,
+        baseImponible * categoryConfig.minInitialRate,
         categoryConfig.minDigits
       )
     );
-  }, [categoryConfig, safeBaseForRules]);
+  }, [categoryConfig, baseImponible, safeBaseForRules]);
 
   const suggestedInitialAmount = useMemo(() => {
-    if (!categoryConfig || safeBaseForRules <= 0) return 0;
+    if (!categoryConfig || baseImponible <= 0) return 0;
     return (
-      evaluateInitialFormula(
-        categoryConfig.suggestedFormula,
-        safeBaseForRules
-      ) ??
+      // La fórmula de la hoja ya divide entre 1,03: se le pasa el PRECIO
+      evaluateInitialFormula(categoryConfig.suggestedFormula, safeBaseForRules) ??
       roundUpByRule(
-        safeBaseForRules * categoryConfig.suggestedInitialRate,
+        baseImponible * categoryConfig.suggestedInitialRate,
         categoryConfig.suggestedDigits
       )
     );
-  }, [categoryConfig, safeBaseForRules]);
+  }, [categoryConfig, baseImponible, safeBaseForRules]);
 
-  // La inicial que se autocompleta es siempre la sugerida (nunca menor a la mínima)
-  const autoInitialAmount = Math.ceil(
-    Math.max(suggestedInitialAmount, minInitialAmount)
-  );
+  // La inicial que se autocompleta es la mínima (igual que la versión vieja)
+  const autoInitialAmount = Math.ceil(minInitialAmount);
 
-  // I.V.A. del crédito: (precio / 1,03) x 16 %  (el precio ya incluye el IGTF)
-  const vatAmount = (safeBaseForRules / CONTADO_DIVISOR) * VAT_RATE;
+  // I.V.A. normal: (precio / 1,03) x 16 %  (el precio ya incluye el IGTF)
+  const vatAmount = baseImponible * VAT_RATE;
 
   // --- Contado: I.V.A. = (monto / 1,03) x 16 % ---
   const contadoMonto =
@@ -718,17 +719,7 @@ function CalculadoraFinanciamientoBNH() {
     }
 
     if (
-      initialAmount !== "" &&
-      Number.isFinite(numericInitial) &&
-      numericInitial >= 0 &&
-      !Number.isInteger(numericInitial)
-    ) {
-      errors.push("No válido: la inicial debe ser un número entero (ej. 5000, 5500, 6000).");
-    }
-
-    if (
-      Number.isFinite(numericBase) &&
-      numericBase > 0 &&
+      baseImponible > 0 &&
       Number.isFinite(numericInitial) &&
       numericInitial < minInitialAmount
     ) {
@@ -740,10 +731,9 @@ function CalculadoraFinanciamientoBNH() {
     }
 
     if (
-      Number.isFinite(numericBase) &&
-      numericBase > 0 &&
+      baseImponible > 0 &&
       Number.isFinite(numericInitial) &&
-      numericInitial >= numericBase
+      numericInitial >= baseImponible
     ) {
       errors.push("No válido: la inicial debe ser menor a la base imponible.");
     }
@@ -774,11 +764,10 @@ function CalculadoraFinanciamientoBNH() {
     numericInitial,
     numericInstallments,
     minInitialAmount,
+    baseImponible,
   ]);
 
   const calculations = useMemo(() => {
-    const safeBase = safeBaseForRules;
-
     const safeInitial =
       Number.isFinite(numericInitial) && numericInitial >= 0
         ? numericInitial
@@ -801,17 +790,15 @@ function CalculadoraFinanciamientoBNH() {
       annualIrr: null as number | null,
     };
 
-    if (!categoryConfig || safeBase <= 0 || safeInstallments <= 0) {
+    if (!categoryConfig || baseImponible <= 0 || safeInstallments <= 0) {
       return empty;
     }
 
     const term = activeTerms.find((t) => t.meses === safeInstallments);
     if (!term) return empty;
 
-    // Precio comercial = (base + I.V.A.) + IGTF 3 %, con base = precio / 1,03
-    // (equivale a lo que hacía la versión vieja con la base imponible)
-    const netBase = safeBase / CONTADO_DIVISOR;
-    const commercialPrice = (netBase + ivaCredito) * (1 + IGTF_RATE);
+    // Precio comercial = (base imponible + I.V.A.) x 1,03 (IGTF), como la versión vieja
+    const commercialPrice = (baseImponible + ivaCredito) * (1 + IGTF_RATE);
 
     if (commercialPrice - safeInitial <= 0) return empty;
 
@@ -836,7 +823,7 @@ function CalculadoraFinanciamientoBNH() {
       annualIrr: search.annualIrr,
     };
   }, [
-    safeBaseForRules,
+    baseImponible,
     numericInitial,
     numericInstallments,
     ivaCredito,
@@ -854,7 +841,6 @@ function CalculadoraFinanciamientoBNH() {
     numericBase > 0 &&
     Number.isFinite(numericInitial) &&
     numericInitial >= minInitialAmount &&
-    Number.isInteger(numericInitial) &&
     Number.isInteger(numericInstallments) &&
     numericInstallments > 0 &&
     validations.length === 0 &&
@@ -1174,7 +1160,7 @@ function CalculadoraFinanciamientoBNH() {
                 <Input
                   type="number"
                   min={minInitialAmount || 0}
-                  step={100}
+                  step="0.01"
                   value={initialAmount}
                   onChange={(e) => setInitialAmount(e.target.value)}
                   placeholder="Ej. 5000"
