@@ -4,9 +4,8 @@
  * Backend en Google Apps Script, vinculado al Google Sheet que actúa
  * como base de datos de la calculadora.
  *
- * 
- *COMPrtido
- *
+ * Hoja CATEGORIA: cada columna de plazo (12, 15, 18) trae SOLO el AIRR
+ * objetivo (ej. 25% o 0.25). La cuota se calcula en el front (page.tsx).
  */
 
 var SHEET_PRECIOS = "PRECIO EQUIPOS";
@@ -142,7 +141,8 @@ function getEquipos_() {
 
 /**
  * Lee la hoja "CATEGORIA" y devuelve una entrada por categoría (columna A,
- * valores únicos) con sus condiciones de financiamiento ya interpretadas.
+ * valores únicos) con su inicial mínima/sugerida y el AIRR objetivo por plazo:
+ *   plazos: [{ meses: 12, airr: 0.25 }, ...]
  */
 function getCategorias_() {
   var sheet = getSheet_(SHEET_CATEGORIA);
@@ -199,35 +199,31 @@ function getCategorias_() {
     }
     var cat = byKey[key];
 
-    // Las filas de una misma categoría repiten las reglas: se toma la primera que se pueda interpretar.
+    // Si la categoría se repite en varias filas, se toma la primera regla interpretable.
     if (!cat.inicialMinima && idxMin !== -1) cat.inicialMinima = parseInitialRule_(row[idxMin]);
     if (!cat.inicialSugerida && idxSug !== -1) cat.inicialSugerida = parseInitialRule_(row[idxSug]);
 
     for (var t = 0; t < termCols.length; t++) {
-      var meses = termCols[t].meses;
-      var yaExiste = cat.plazos.some(function (p) { return p.meses === meses; });
+      var mesesPlazo = termCols[t].meses;
+      var yaExiste = cat.plazos.some(function (p) { return p.meses === mesesPlazo; });
       if (yaExiste) continue;
 
-      var cellVal = row[termCols[t].col];
-      // Reemplaza referencias tipo I$2 / J$2 por su valor en la hoja (tasa mensual)
-      if (typeof cellVal === "string") cellVal = resolveCellRefs_(cellVal, values);
-      var rate = parseTermRate_(cellVal, meses);
-      if (rate) {
-        cat.plazos.push({
-          meses: meses,
-          formula: rate.formula,
-          factor: rate.factor,
-          tasaMensual: rate.tasaMensual,
-        });
+      // Solo el AIRR objetivo; vacío o "Sin calculo" = el plazo no se ofrece.
+      var airr = parseAirr_(row[termCols[t].col]);
+      if (airr !== null) {
+        cat.plazos.push({ meses: mesesPlazo, airr: airr });
       }
     }
   }
 
-  return order.map(function (k) {
-    var cat = byKey[k];
-    cat.plazos.sort(function (a, b) { return a.meses - b.meses; });
-    return cat;
-  });
+  // Se descartan filas sin ningún plazo con AIRR (ej. notas o textos sueltos en la columna A).
+  return order
+    .map(function (k) {
+      var cat = byKey[k];
+      cat.plazos.sort(function (a, b) { return a.meses - b.meses; });
+      return cat;
+    })
+    .filter(function (cat) { return cat.plazos.length > 0; });
 }
 
 /**
@@ -289,96 +285,35 @@ function parseInitialRule_(cell) {
 }
 
 /**
- * Interpreta la celda de un plazo. Devuelve { formula, factor, tasaMensual } o null si
- * el plazo no está disponible ("Sin calculo" / vacío / no interpretable).
- *
- *  - Fórmula de cuota (formato actual):
- *      "CEILING(((Precio / 1.03) - Inicial) *1.20 / Cuotas, 10)"
- *    -> { formula: <texto tal cual>, factor: 1.20, tasaMensual: null }
- *    (el front evalúa la fórmula; "factor" es solo respaldo y etiqueta).
- *  - Formato anterior: "=(1.30 ^ (1 / 18))" -> { formula: null, factor: 1.30, tasaMensual: 1.30^(1/18) - 1 }
+ * Lee el AIRR objetivo de la celda de un plazo y lo devuelve como fracción anual
+ * (0.25 = 25%). Acepta:
+ *   - número de Sheets formateado como %  -> 0.25  (se deja igual)
+ *   - número entero tipo porcentaje       -> 25    (se convierte a 0.25)
+ *   - texto "25%", "25 %", "25", "0,25"
+ * Devuelve null si la celda está vacía, dice "Sin calculo" o no es interpretable
+ * (ese plazo no se ofrece).
  */
-function parseTermRate_(cell, meses) {
+function parseAirr_(cell) {
   if (cell === "" || cell === null || cell === undefined) return null;
 
-  if (typeof cell !== "number") {
+  var n;
+  if (typeof cell === "number") {
+    n = cell;
+  } else {
     var raw = String(cell).trim();
     if (!raw || /sin\s*c[aá]lculo/i.test(raw)) return null;
 
-    if (/^=?\s*(ceiling|techo|multiplo\.superior)\s*\(/i.test(raw)) {
-      return { formula: raw.replace(/^=\s*/, ""), factor: extractMultiplier_(raw), tasaMensual: null };
-    }
+    var hasPct = /%/.test(raw);
+    n = parseFloat(raw.replace("%", "").replace(/\s+/g, "").replace(",", "."));
+    if (!isFinite(n)) return null;
+    if (hasPct) n = n / 100;
   }
 
-  var factor = null;
-
-  if (typeof cell === "number") {
-    if (cell > 0 && cell < 1) factor = 1 + cell;       // 0.30 -> 1.30
-    else if (cell > 1 && cell < 3) factor = cell;      // 1.30
-  } else {
-    var text = String(cell);
-
-    var m = text.match(/\(\s*(\d+(?:[.,]\d+)?)\s*\^/);
-    if (m) {
-      factor = parseFloat(m[1].replace(",", "."));
-    } else {
-      var mm = text.match(/(\d+(?:[.,]\d+)?)\s*%\s*mensual/i);
-      if (mm) {
-        var monthly = parseFloat(mm[1].replace(",", ".")) / 100;
-        factor = Math.pow(1 + monthly, meses);
-      }
-    }
-  }
-
-  if (!factor || !isFinite(factor) || factor <= 1 || factor >= 3) return null;
-  return { formula: null, factor: factor, tasaMensual: Math.pow(factor, 1 / meses) - 1 };
+  if (!isFinite(n) || n <= 0) return null;
+  if (n >= 1) n = n / 100; // 25 -> 0.25
+  if (n <= 0 || n >= 1) return null;
+  return n;
 }
-
-/** Primer multiplicador entre 1 y 3 que sigue a un "*" en la fórmula (ej. "*1.20" -> 1.2). */
-function extractMultiplier_(text) {
-  var re = /\*\s*(\d+(?:[.,]\d+)?)/g;
-  var m;
-  while ((m = re.exec(text)) !== null) {
-    var v = parseFloat(m[1].replace(",", "."));
-    if (isFinite(v) && v > 1 && v < 3) return v;
-  }
-  return null;
-}
-/**
- * Reemplaza referencias de celda (I$2, $J$2, K2...) dentro del texto de una fórmula
- * por el valor que tienen en la hoja (ej. I$2 -> 0.029). Si no puede resolverla, la deja igual.
- */
-function resolveCellRefs_(text, values) {
-  var re = /(?<![A-Za-z0-9_.])\$?([A-Z]{1,2})\$?(\d{1,4})(?![A-Za-z0-9_.])/g;
-  return String(text).replace(re, function (match, colLetters, rowNum) {
-    var r = Number(rowNum) - 1;
-    var c = colLettersToIndex_(colLetters);
-    if (r < 0 || c < 0 || r >= values.length || c >= values[r].length) return match;
-
-    var v = values[r][c];
-    var n;
-    if (typeof v === "number") {
-      n = v;
-    } else {
-      var s = String(v || "").trim();
-      var isPct = /%\s*$/.test(s);
-      n = parseFloat(s.replace("%", "").replace(",", "."));
-      if (isPct) n = n / 100;
-    }
-    return isFinite(n) ? String(n) : match;
-  });
-}
-
-function colLettersToIndex_(letters) {
-  var n = 0;
-  for (var i = 0; i < letters.length; i++) {
-    n = n * 26 + (letters.charCodeAt(i) - 64);
-  }
-  return n - 1; // 0-based
-}
-
-
-
 
 /** Número desde una celda (acepta números y textos como "$12.855,00"). */
 function toNumber_(v) {
@@ -881,7 +816,6 @@ function appendConditions_(body) {
   var lines = [
     "Vigencia de la cotización: 7 días naturales.",
     "Incluye: Garantía, instalación y capacitación (según equipo).",
-    
   ];
 
   for (var i = 0; i < lines.length; i++) {
