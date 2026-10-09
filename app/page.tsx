@@ -25,17 +25,22 @@ import {
   type PlazoCategoria,
   type ReglaInicial,
 } from "@/lib/apps-script-api";
-import {
-  evaluateInitialFormula,
-  evaluateInstallmentFormula,
-} from "@/lib/initial-formula";
+import { evaluateInitialFormula } from "@/lib/initial-formula";
 
-// Las categorías, la inicial mínima/sugerida y la fórmula de cuota por plazo salen de la
+// Las categorías, la inicial mínima/sugerida y el AIRR objetivo por plazo salen de la
 // hoja "CATEGORIA" del Google Sheet. Solo estos valores no están en la hoja:
 const VAT_RATE = 0.16;
 const MIN_INITIAL_RATE_DEFAULT = 0.2;
 const SUGGESTED_INITIAL_RATE_DEFAULT = 0.25;
 const ACCESS_PASSWORD = "BNH2026";
+
+// IGTF: ya viene incluido en el precio de crédito sobre la base; si el I.V.A. se
+// financia, también se financia el IGTF sobre el I.V.A.
+const IGTF_RATE = 0.03;
+
+// Control interno: muestra en pantalla el AIRR resultante de la cuota redondeada.
+// Dejar en false en producción (con true además se avisa por console.warn si queda bajo el objetivo).
+const SHOW_AIRR_CONTROL = false;
 
 // Categorías (nombre normalizado) que no permiten pagar el I.V.A. por separado
 const CATEGORIES_WITHOUT_SEPARATE_VAT = ["teair"];
@@ -111,11 +116,18 @@ function toRule(rule: ReglaInicial | null, fallbackRate: number) {
   };
 }
 
-// Cuota nivelada (PMT) con tasa mensual; sin tasa, reparto simple.
-function monthlyPaymentFor(principal: number, monthlyRate: number, n: number) {
-  if (n <= 0) return 0;
-  if (monthlyRate <= 0) return principal / n;
-  return (principal * monthlyRate) / (1 - Math.pow(1 + monthlyRate, -n));
+// TIR (por mes) de un flujo de caja; el flujo[0] es negativo (mes 0).
+function calculateIRR(flows: number[]): number {
+  const npv = (r: number) =>
+    flows.reduce((acc, cf, t) => acc + cf / Math.pow(1 + r, t), 0);
+  let lo = -0.99,
+    hi = 1;
+  for (let i = 0; i < 200; i++) {
+    const mid = (lo + hi) / 2;
+    if (npv(mid) > 0) lo = mid;
+    else hi = mid;
+  }
+  return (lo + hi) / 2;
 }
 
 export default function Page() {
@@ -600,6 +612,8 @@ function CalculadoraFinanciamientoBNH() {
       totalToPay: safeInitial,
       ivaToPayField: ivaSeparate,
       financedAmount: 0,
+      airrResultante: null as number | null,
+      airrObjetivo: null as number | null,
     };
 
     if (!categoryConfig || safeBase <= 0 || safeInstallments <= 0) {
@@ -608,42 +622,45 @@ function CalculadoraFinanciamientoBNH() {
 
     const term = categoryConfig.terms.find((t) => t.meses === safeInstallments);
     if (!term) return empty;
+    if (safeBase - safeInitial <= 0) return empty;
 
-    // Base neta del crédito: Precio / 1,03 (igual que en la fórmula de la hoja)
-    const netBase = safeBase / CONTADO_DIVISOR;
+    // 1) Tasa mensual a partir del AIRR objetivo de la hoja (exponente siempre 1/12)
+    const r = Math.pow(1 + term.airr, 1 / 12) - 1;
 
-    if (netBase - safeInitial <= 0) return empty;
+    // Valor presente de $1 pagado cada mes durante n meses = VA(r; n; -1)
+    const va =
+      r > 0
+        ? (1 - Math.pow(1 + r, -safeInstallments)) / r
+        : safeInstallments;
 
-    // Monto financiado = base neta - inicial + I.V.A. (solo si el I.V.A. se financia)
-    let financedAmount = netBase - safeInitial + ivaFinanced;
+    // 2) Lo que la empresa adelanta en el mes 0
+    //    IVA financiado (Sí): IGTF sobre base + IVA  -> se suma IVA x 3%
+    //    IVA aparte (No):     IGTF solo sobre la base (ya incluido en el precio)
+    const igtfSobreIva = ivaFinancing === "si" ? ivaCredito * IGTF_RATE : 0;
+    const montoMes0 = safeBase - safeInitial + ivaCredito + igtfSobreIva;
 
-    // Cuota: se evalúa la fórmula de la hoja CATEGORIA tal cual, por ejemplo
-    // CEILING(((Precio / 1.03) - Inicial) *1.20 / Cuotas, 10).
-    // Para que incluya el I.V.A. financiado se usa una "inicial efectiva" reducida
-    // en ese I.V.A.: (netBase - (inicial - iva)) = netBase - inicial + iva
-    let roundedMonthlyPayment = evaluateInstallmentFormula(term.formula, {
-      precio: safeBase,
-      inicial: safeInitial - ivaFinanced,
-      cuotas: safeInstallments,
-    });
+    // 3) Cuota sin redondear según cómo se paga el IVA
+    const rawPayment =
+      ivaFinancing === "si"
+        ? montoMes0 / va // PAGO(r; n; -monto)
+        : (montoMes0 - ivaCredito / (1 + r)) / (va / (1 + r)); // IVA en mes 1, cuotas meses 2..n+1
 
-    // Respaldo: fórmula no interpretable pero con multiplicador detectado
-    if (roundedMonthlyPayment === null && term.tasaMensual === null && term.factor) {
-      roundedMonthlyPayment = roundUpToMultiple(
-        (financedAmount * term.factor) / safeInstallments,
-        10
-      );
+    const roundedMonthlyPayment = roundUpToNearest5(rawPayment);
+
+    // Monto financiado que se muestra en pantalla
+    const financedAmount =
+      safeBase - safeInitial + ivaFinanced + igtfSobreIva;
+
+    // 4) Control: AIRR resultante con la cuota ya redondeada
+    let airrResultante: number | null = null;
+    if (roundedMonthlyPayment > 0) {
+      const cuotas = Array(safeInstallments).fill(roundedMonthlyPayment);
+      const flows =
+        ivaFinancing === "si"
+          ? [-montoMes0, ...cuotas]
+          : [-montoMes0, ivaCredito, ...cuotas];
+      airrResultante = Math.pow(1 + calculateIRR(flows), 12) - 1;
     }
-
-    // Formato anterior de la hoja (tasa mensual): cuota nivelada PMT
-    if (roundedMonthlyPayment === null && term.tasaMensual !== null) {
-      financedAmount = safeBase - safeInitial + ivaFinanced;
-      roundedMonthlyPayment = roundUpToNearest5(
-        monthlyPaymentFor(financedAmount, term.tasaMensual, safeInstallments)
-      );
-    }
-
-    if (roundedMonthlyPayment === null) return empty;
 
     const totalToPay =
       safeInitial + ivaSeparate + roundedMonthlyPayment * safeInstallments;
@@ -653,6 +670,8 @@ function CalculadoraFinanciamientoBNH() {
       totalToPay,
       ivaToPayField: ivaSeparate,
       financedAmount,
+      airrResultante,
+      airrObjetivo: term.airr as number | null,
     };
   }, [
     safeBaseForRules,
@@ -662,6 +681,22 @@ function CalculadoraFinanciamientoBNH() {
     ivaFinancing,
     categoryConfig,
   ]);
+
+  // Control de prueba: avisa si el AIRR resultante queda por debajo del objetivo
+  useEffect(() => {
+    if (!SHOW_AIRR_CONTROL) return;
+    const { airrResultante, airrObjetivo } = calculations;
+    if (airrResultante !== null && airrObjetivo !== null) {
+      console.log(
+        `AIRR objetivo ${(airrObjetivo * 100).toFixed(2)}% | resultante ${(
+          airrResultante * 100
+        ).toFixed(2)}%`
+      );
+      if (airrResultante < airrObjetivo - 1e-6) {
+        console.warn("El AIRR resultante quedó por debajo del objetivo: revisar el cálculo.");
+      }
+    }
+  }, [calculations]);
 
   const isValid =
     !!categoryConfig &&
@@ -1380,6 +1415,18 @@ function CalculadoraFinanciamientoBNH() {
                   title="Total crédito a pagar"
                   total={calculations.totalToPay}
                 />
+
+                {SHOW_AIRR_CONTROL &&
+                  isValid &&
+                  calculations.airrResultante !== null &&
+                  calculations.airrObjetivo !== null && (
+                    <p className="mt-3 text-xs text-gray-400">
+                      Control interno · AIRR objetivo{" "}
+                      {(calculations.airrObjetivo * 100).toFixed(2)}% · AIRR
+                      resultante{" "}
+                      {(calculations.airrResultante * 100).toFixed(2)}%
+                    </p>
+                  )}
               </div>
 
               <Button
