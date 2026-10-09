@@ -1,4 +1,4 @@
- "use client";
+"use client";
 
 import Image from "next/image";
 import React, { useEffect, useMemo, useState } from "react";
@@ -28,6 +28,8 @@ import {
 import {
   evaluateInitialFormula,
   evaluateInstallmentFormula,
+  formulaUsesIva,
+  formulaUsesNetBase,
 } from "@/lib/initial-formula";
 
 // Las categorías, la inicial mínima/sugerida y la fórmula de cuota por plazo salen de la
@@ -54,7 +56,9 @@ type CategoryConfig = {
   suggestedInitialRate: number;
   suggestedDigits: number | null;
   suggestedFormula: string | null;
-  terms: PlazoCategoria[];
+  // Plazos con I.V.A. financiado = Sí (columnas D:F) y = No (columnas G:I)
+  termsSi: PlazoCategoria[];
+  termsNo: PlazoCategoria[];
   canPayVATSeparately: boolean;
 };
 
@@ -378,12 +382,21 @@ function CalculadoraFinanciamientoBNH() {
       suggestedInitialRate: suggested.rate,
       suggestedDigits: suggested.digits,
       suggestedFormula: suggested.formula,
-      terms: found.plazos,
+      termsSi: found.plazosSi ?? [],
+      termsNo: found.plazosNo ?? [],
       canPayVATSeparately: !CATEGORIES_WITHOUT_SEPARATE_VAT.includes(
         normalizeText(found.nombre)
       ),
     };
   }, [categorias, category]);
+
+  // Plazos vigentes según "Financiamiento del I.V.A." (Sí = D:F, No = G:I de la hoja)
+  const activeTerms = useMemo<PlazoCategoria[]>(() => {
+    if (!categoryConfig) return [];
+    return ivaFinancing === "si"
+      ? categoryConfig.termsSi
+      : categoryConfig.termsNo;
+  }, [categoryConfig, ivaFinancing]);
 
   const numericBase = Number(basePrice);
   const numericInitial = Number(initialAmount);
@@ -470,16 +483,16 @@ function CalculadoraFinanciamientoBNH() {
     }
   }, [categoryConfig]);
 
-  // Si el plazo elegido no existe en la categoría, se limpia
+  // Si el plazo elegido no existe en la categoría / modo de I.V.A., se limpia
   useEffect(() => {
     if (
       categoryConfig &&
       installments !== "" &&
-      !categoryConfig.terms.some((t) => String(t.meses) === installments)
+      !activeTerms.some((t) => String(t.meses) === installments)
     ) {
       setInstallments("");
     }
-  }, [categoryConfig, installments]);
+  }, [categoryConfig, activeTerms, installments]);
 
   useEffect(() => {
     if (categoryConfig && Number.isFinite(numericBase) && numericBase > 0) {
@@ -553,9 +566,13 @@ function CalculadoraFinanciamientoBNH() {
     if (
       installments !== "" &&
       Number.isInteger(numericInstallments) &&
-      !categoryConfig.terms.some((t) => t.meses === numericInstallments)
+      !activeTerms.some((t) => t.meses === numericInstallments)
     ) {
-      errors.push("No válido: este plazo no está disponible para la categoría.");
+      errors.push(
+        `No válido: este plazo no está disponible para la categoría con I.V.A. financiado "${
+          ivaFinancing === "si" ? "Sí" : "No"
+        }".`
+      );
     }
 
     if (!categoryConfig.canPayVATSeparately && ivaFinancing === "no") {
@@ -565,6 +582,7 @@ function CalculadoraFinanciamientoBNH() {
     return errors;
   }, [
     categoryConfig,
+    activeTerms,
     basePrice,
     contadoPriceInput,
     initialAmount,
@@ -606,25 +624,28 @@ function CalculadoraFinanciamientoBNH() {
       return empty;
     }
 
-    const term = categoryConfig.terms.find((t) => t.meses === safeInstallments);
+    // Fórmula del bloque correspondiente (Sí = D:F, No = G:I de la hoja CATEGORIA)
+    const term = activeTerms.find((t) => t.meses === safeInstallments);
     if (!term) return empty;
 
-    // Base neta del crédito: Precio / 1,03 (igual que en la fórmula de la hoja)
-    const netBase = safeBase / CONTADO_DIVISOR;
+    // Si la fórmula menciona IVA, ella decide cómo sumarlo; si no, en modo "Sí"
+    // se suma al monto financiado reduciendo la inicial efectiva.
+    const usesIva = formulaUsesIva(term.formula);
 
-    if (netBase - safeInitial <= 0) return empty;
+    // Fórmulas nuevas (Precio-Inicial) no dividen entre 1,03; las viejas sí.
+    const basis = formulaUsesNetBase(term.formula)
+      ? safeBase / CONTADO_DIVISOR
+      : safeBase;
 
-    // Monto financiado = base neta - inicial + I.V.A. (solo si el I.V.A. se financia)
-    let financedAmount = netBase - safeInitial + ivaFinanced;
+    if (basis - safeInitial <= 0) return empty;
 
-    // Cuota: se evalúa la fórmula de la hoja CATEGORIA tal cual, por ejemplo
-    // CEILING(((Precio / 1.03) - Inicial) *1.20 / Cuotas, 10).
-    // Para que incluya el I.V.A. financiado se usa una "inicial efectiva" reducida
-    // en ese I.V.A.: (netBase - (inicial - iva)) = netBase - inicial + iva
+    let financedAmount = basis - safeInitial + ivaFinanced;
+
     let roundedMonthlyPayment = evaluateInstallmentFormula(term.formula, {
       precio: safeBase,
-      inicial: safeInitial - ivaFinanced,
+      inicial: usesIva ? safeInitial : safeInitial - ivaFinanced,
       cuotas: safeInstallments,
+      iva: ivaFinanced,
     });
 
     // Respaldo: fórmula no interpretable pero con multiplicador detectado
@@ -661,6 +682,7 @@ function CalculadoraFinanciamientoBNH() {
     ivaCredito,
     ivaFinancing,
     categoryConfig,
+    activeTerms,
   ]);
 
   const isValid =
@@ -671,7 +693,7 @@ function CalculadoraFinanciamientoBNH() {
     numericInitial >= minInitialAmount &&
     Number.isInteger(numericInstallments) &&
     numericInstallments > 0 &&
-    categoryConfig.terms.some((t) => t.meses === numericInstallments) &&
+    activeTerms.some((t) => t.meses === numericInstallments) &&
     validations.length === 0 &&
     Number.isInteger(numericInitial) &&
     calculations.roundedMonthlyPayment > 0;
@@ -1173,7 +1195,7 @@ function CalculadoraFinanciamientoBNH() {
                 <Select
                   value={installments}
                   onValueChange={setInstallments}
-                  disabled={!categoryConfig || categoryConfig.terms.length === 0}
+                  disabled={!categoryConfig || activeTerms.length === 0}
                 >
                   <SelectTrigger
                     className="rounded-xl"
@@ -1189,7 +1211,7 @@ function CalculadoraFinanciamientoBNH() {
                       fontFamily: "Verdana, sans-serif",
                     }}
                   >
-                    {(categoryConfig?.terms ?? []).map((term) => (
+                    {activeTerms.map((term) => (
                       <SelectItem
                         key={term.meses}
                         value={String(term.meses)}
@@ -1205,9 +1227,11 @@ function CalculadoraFinanciamientoBNH() {
 
                 <p className="mt-2 text-xs text-gray-500">
                   {categoryConfig
-                    ? `Plazos disponibles: ${categoryConfig.terms
-                        .map((t) => t.meses)
-                        .join(", ")} cuotas`
+                    ? activeTerms.length > 0
+                      ? `Plazos disponibles: ${activeTerms
+                          .map((t) => t.meses)
+                          .join(", ")} cuotas`
+                      : "No hay plazos disponibles para esta categoría con la opción de I.V.A. elegida"
                     : "Seleccione un equipo para ver los plazos disponibles"}
                 </p>
               </div>
