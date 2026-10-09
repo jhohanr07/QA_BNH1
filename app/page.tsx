@@ -1,7 +1,7 @@
 "use client";
 
 import Image from "next/image";
-import React, { useEffect, useMemo, useState } from "react";
+import { useEffect, useMemo, useState } from "react";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
@@ -32,6 +32,8 @@ import { evaluateInitialFormula } from "@/lib/initial-formula";
 const VAT_RATE = 0.16;
 const MIN_INITIAL_RATE_DEFAULT = 0.2;
 const SUGGESTED_INITIAL_RATE_DEFAULT = 0.25;
+// OJO: esta clave queda visible en el navegador. Para algo realmente privado,
+// valídala en el servidor (route handler + cookie httpOnly o middleware).
 const ACCESS_PASSWORD = "BNH2026";
 
 // IGTF: ya viene incluido en el precio de crédito sobre la base; si el I.V.A. se
@@ -40,7 +42,7 @@ const IGTF_RATE = 0.03;
 
 // Control interno: muestra en pantalla el AIRR resultante de la cuota redondeada.
 // Dejar en false en producción (con true además se avisa por console.warn si queda bajo el objetivo).
-const SHOW_AIRR_CONTROL = false;
+const SHOW_AIRR_CONTROL: boolean = false;
 
 // Categorías (nombre normalizado) que no permiten pagar el I.V.A. por separado
 const CATEGORIES_WITHOUT_SEPARATE_VAT = ["teair"];
@@ -50,6 +52,8 @@ const INITIAL_STEP = 500;
 
 // El precio incluye 3 %; el I.V.A. = (precio / 1,03) x 16 % (contado y crédito)
 const CONTADO_DIVISOR = 1.03;
+
+const EMAIL_REGEX = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
 
 type CategoryConfig = {
   nombre: string;
@@ -76,9 +80,11 @@ function formatCurrency(value: number) {
   }).format(value);
 }
 
+// Redondea la cuota hacia arriba al múltiplo de 5; el epsilon evita que el ruido
+// de punto flotante (ej. 100.0000000001) suba la cuota $5 de más.
 function roundUpToNearest5(value: number) {
   if (!Number.isFinite(value) || value <= 0) return 0;
-  return Math.ceil(value / 5) * 5;
+  return Math.ceil(value / 5 - 1e-9) * 5;
 }
 
 function roundUpToMultiple(value: number, step: number) {
@@ -130,16 +136,10 @@ function calculateIRR(flows: number[]): number {
   return (lo + hi) / 2;
 }
 
-
 export default function Page() {
-  const [isAuthenticated, setIsAuthenticated] =
-    useState(false);
-
-  const [password, setPassword] =
-    useState("");
-
-  const [accessError, setAccessError] =
-    useState("");
+  const [isAuthenticated, setIsAuthenticated] = useState(false);
+  const [password, setPassword] = useState("");
+  const [accessError, setAccessError] = useState("");
 
   const handleLogin = () => {
     if (password === ACCESS_PASSWORD) {
@@ -154,10 +154,7 @@ export default function Page() {
     return (
       <div
         className="min-h-screen bg-[#f3f5f7] px-6 py-10"
-        style={{
-          fontFamily:
-            "Verdana, sans-serif",
-        }}
+        style={{ fontFamily: "Verdana, sans-serif" }}
       >
         <div className="mx-auto flex max-w-md flex-col items-center justify-center">
           <div className="mb-8 rounded-3xl bg-white px-8 py-6 shadow-sm ring-1 ring-gray-200">
@@ -178,9 +175,7 @@ export default function Page() {
               </CardTitle>
 
               <p className="mt-2 text-sm text-gray-600">
-                Ingrese la clave para acceder
-                a la calculadora de
-                financiamiento
+                Ingrese la clave para acceder a la calculadora de financiamiento
               </p>
             </CardHeader>
 
@@ -193,11 +188,10 @@ export default function Page() {
                 <Input
                   type="password"
                   value={password}
-                  onChange={(e) =>
-                    setPassword(
-                      e.target.value
-                    )
-                  }
+                  onChange={(e) => setPassword(e.target.value)}
+                  onKeyDown={(e) => {
+                    if (e.key === "Enter") handleLogin();
+                  }}
                   placeholder="Ingrese su clave"
                   className="h-12 rounded-xl"
                 />
@@ -205,9 +199,7 @@ export default function Page() {
 
               {accessError && (
                 <Alert className="border-red-200 bg-red-50">
-                  <AlertDescription>
-                    {accessError}
-                  </AlertDescription>
+                  <AlertDescription>{accessError}</AlertDescription>
                 </Alert>
               )}
 
@@ -660,7 +652,7 @@ function CalculadoraFinanciamientoBNH() {
         ivaFinancing === "si"
           ? [-montoMes0, ...cuotas]
           : [-montoMes0, ivaCredito, ...cuotas];
-      const airrResultante = Math.pow(1 + calculateIRR(flows), 12) - 1;
+      airrResultante = Math.pow(1 + calculateIRR(flows), 12) - 1;
     }
 
     const totalToPay =
@@ -694,7 +686,9 @@ function CalculadoraFinanciamientoBNH() {
         ).toFixed(2)}%`
       );
       if (airrResultante < airrObjetivo - 1e-6) {
-        console.warn("El AIRR resultante quedó por debajo del objetivo: revisar el cálculo.");
+        console.warn(
+          "El AIRR resultante quedó por debajo del objetivo: revisar el cálculo."
+        );
       }
     }
   }, [calculations]);
@@ -744,6 +738,11 @@ function CalculadoraFinanciamientoBNH() {
       return;
     }
 
+    if (!EMAIL_REGEX.test(leadEmail.trim())) {
+      setSendQuoteError("El email del lead no tiene un formato válido.");
+      return;
+    }
+
     setSendingQuote(true);
 
     try {
@@ -788,13 +787,13 @@ function CalculadoraFinanciamientoBNH() {
     }
   };
 
+  const selectFont = { fontFamily: "Verdana, sans-serif" };
+  const catalogLoading = equiposLoading || categoriasLoading;
+
   return (
     <div
       className="min-h-screen bg-[#f3f5f7] px-4 py-6 md:px-6 md:py-8"
-      style={{
-        fontFamily:
-          "Verdana, sans-serif",
-      }}
+      style={{ fontFamily: "Verdana, sans-serif" }}
     >
       <div className="mx-auto max-w-7xl">
         <div className="mb-6 bg-transparent md:mb-8">
@@ -812,19 +811,15 @@ function CalculadoraFinanciamientoBNH() {
 
             <div>
               <h1 className="text-3xl font-bold tracking-tight text-gray-900 md:text-4xl">
-                Calculadora de
-                Financiamiento
+                Calculadora de Financiamiento
               </h1>
 
               <p className="mt-2 text-sm text-gray-600 md:text-base">
-                Simulación comercial
-                para planes de
-                financiamiento
+                Simulación comercial para planes de financiamiento
               </p>
 
               <div className="mt-4 inline-flex rounded-full bg-[#0d6f91]/10 px-4 py-2 text-sm font-medium text-[#0d6f91]">
-                BNH Medical ·
-                Herramienta interna
+                BNH Medical · Herramienta interna
               </div>
             </div>
           </div>
@@ -840,84 +835,53 @@ function CalculadoraFinanciamientoBNH() {
           <CardContent>
             <div className="grid gap-5 sm:grid-cols-2 lg:grid-cols-4">
               <div>
-                <Label className="mb-2 block">
-                  Nombre del lead
-                </Label>
-
+                <Label className="mb-2 block">Nombre del lead</Label>
                 <Input
                   type="text"
                   value={leadName}
-                  onChange={(e) =>
-                    setLeadName(e.target.value)
-                  }
+                  onChange={(e) => setLeadName(e.target.value)}
                   placeholder="Ej. Dr. Juan Rodríguez"
                   className="rounded-xl"
                 />
               </div>
 
               <div>
-                <Label className="mb-2 block">
-                  Teléfono
-                </Label>
-
+                <Label className="mb-2 block">Teléfono</Label>
                 <Input
                   type="tel"
                   value={leadPhone}
-                  onChange={(e) =>
-                    setLeadPhone(e.target.value)
-                  }
+                  onChange={(e) => setLeadPhone(e.target.value)}
                   placeholder="Ej. 0414-1234567"
                   className="rounded-xl"
                 />
               </div>
 
               <div>
-                <Label className="mb-2 block">
-                  Email
-                </Label>
-
+                <Label className="mb-2 block">Email</Label>
                 <Input
                   type="email"
                   value={leadEmail}
-                  onChange={(e) =>
-                    setLeadEmail(e.target.value)
-                  }
+                  onChange={(e) => setLeadEmail(e.target.value)}
                   placeholder="Ej. doctor@clinica.com"
                   className="rounded-xl"
                 />
               </div>
 
               <div>
-                <Label className="mb-2 block">
-                  Vendedor
-                </Label>
+                <Label className="mb-2 block">Vendedor</Label>
 
                 {vendedores.length > 0 ? (
-                  <Select
-                    value={vendedorName}
-                    onValueChange={setVendedorName}
-                  >
-                    <SelectTrigger
-                      className="rounded-xl"
-                      style={{
-                        fontFamily: "Verdana, sans-serif",
-                      }}
-                    >
+                  <Select value={vendedorName} onValueChange={setVendedorName}>
+                    <SelectTrigger className="rounded-xl" style={selectFont}>
                       <SelectValue placeholder="Seleccione un vendedor" />
                     </SelectTrigger>
 
-                    <SelectContent
-                      style={{
-                        fontFamily: "Verdana, sans-serif",
-                      }}
-                    >
+                    <SelectContent style={selectFont}>
                       {vendedores.map((nombre) => (
                         <SelectItem
                           key={nombre}
                           value={nombre}
-                          style={{
-                            fontFamily: "Verdana, sans-serif",
-                          }}
+                          style={selectFont}
                         >
                           {nombre}
                         </SelectItem>
@@ -928,9 +892,7 @@ function CalculadoraFinanciamientoBNH() {
                   <Input
                     type="text"
                     value={vendedorName}
-                    onChange={(e) =>
-                      setVendedorName(e.target.value)
-                    }
+                    onChange={(e) => setVendedorName(e.target.value)}
                     placeholder={
                       vendedoresLoading
                         ? "Cargando vendedores..."
@@ -954,35 +916,28 @@ function CalculadoraFinanciamientoBNH() {
 
             <CardContent className="space-y-5">
               <div>
-                <Label className="mb-2 block">
-                  Equipo
-                </Label>
+                <Label className="mb-2 block">Equipo</Label>
 
                 <Select
                   value={selectedEquipoId}
                   onValueChange={handleEquipoChange}
-                  disabled={equiposLoading || equipos.length === 0}
+                  disabled={
+                    catalogLoading ||
+                    equipos.length === 0 ||
+                    categorias.length === 0
+                  }
                 >
-                  <SelectTrigger
-                    className="rounded-xl"
-                    style={{
-                      fontFamily: "Verdana, sans-serif",
-                    }}
-                  >
+                  <SelectTrigger className="rounded-xl" style={selectFont}>
                     <SelectValue
                       placeholder={
-                        equiposLoading
+                        catalogLoading
                           ? "Cargando equipos..."
                           : "Seleccione un equipo"
                       }
                     />
                   </SelectTrigger>
 
-                  <SelectContent
-                    style={{
-                      fontFamily: "Verdana, sans-serif",
-                    }}
-                  >
+                  <SelectContent style={selectFont}>
                     {equipos.map((equipo) => {
                       const sinPrecio =
                         equipo.precioCredito <= 0 && equipo.precioContado <= 0;
@@ -992,9 +947,7 @@ function CalculadoraFinanciamientoBNH() {
                           key={equipo.id}
                           value={equipo.id}
                           disabled={sinPrecio}
-                          style={{
-                            fontFamily: "Verdana, sans-serif",
-                          }}
+                          style={selectFont}
                         >
                           {equipo.nombre}
                           {sinPrecio ? " — sin precio" : ""}
@@ -1005,35 +958,24 @@ function CalculadoraFinanciamientoBNH() {
                 </Select>
 
                 {equiposError ? (
-                  <p className="mt-2 text-xs text-red-600">
-                    {equiposError}
-                  </p>
+                  <p className="mt-2 text-xs text-red-600">{equiposError}</p>
                 ) : (
                   <p className="mt-2 text-xs text-gray-500">
-                    Al seleccionar un equipo se completan
-                    automáticamente la categoría y los precios de
-                    crédito y de contado; puede ajustar los precios
-                    manualmente.
+                    Al seleccionar un equipo se completan automáticamente la
+                    categoría y los precios de crédito y de contado; puede
+                    ajustar los precios manualmente.
                   </p>
                 )}
               </div>
 
               <div>
-                <Label className="mb-2 block">
-                  Categoría
-                </Label>
+                <Label className="mb-2 block">Categoría</Label>
 
                 {/* Solo lectura: la categoría se define al elegir el equipo */}
-                <Select
-                  value={category}
-                  onValueChange={() => {}}
-                  disabled
-                >
+                <Select value={category} onValueChange={() => {}} disabled>
                   <SelectTrigger
                     className="rounded-xl bg-gray-100 disabled:cursor-default disabled:opacity-100"
-                    style={{
-                      fontFamily: "Verdana, sans-serif",
-                    }}
+                    style={selectFont}
                   >
                     <SelectValue
                       placeholder={
@@ -1044,18 +986,12 @@ function CalculadoraFinanciamientoBNH() {
                     />
                   </SelectTrigger>
 
-                  <SelectContent
-                    style={{
-                      fontFamily: "Verdana, sans-serif",
-                    }}
-                  >
+                  <SelectContent style={selectFont}>
                     {categorias.map((cat) => (
                       <SelectItem
                         key={cat.nombre}
                         value={cat.nombre}
-                        style={{
-                          fontFamily: "Verdana, sans-serif",
-                        }}
+                        style={selectFont}
                       >
                         {cat.nombre}
                       </SelectItem>
@@ -1064,47 +1000,32 @@ function CalculadoraFinanciamientoBNH() {
                 </Select>
 
                 {categoriasError && (
-                  <p className="mt-2 text-xs text-red-600">
-                    {categoriasError}
-                  </p>
+                  <p className="mt-2 text-xs text-red-600">{categoriasError}</p>
                 )}
               </div>
 
               <div>
-                <Label className="mb-2 block">
-                  Precio
-                </Label>
-
+                <Label className="mb-2 block">Precio</Label>
                 <Input
                   type="number"
                   min="0"
                   step="0.01"
                   value={basePrice}
-                  onChange={(e) =>
-                    setBasePrice(
-                      e.target.value
-                    )
-                  }
+                  onChange={(e) => setBasePrice(e.target.value)}
                   placeholder="Ej. 10000"
                   className="rounded-xl"
                 />
               </div>
 
               <div>
-                <Label className="mb-2 block">
-                  Monto inicial
-                </Label>
+                <Label className="mb-2 block">Monto inicial</Label>
 
                 <Input
                   type="number"
                   min={minInitialAmount || 0}
                   step={100}
                   value={initialAmount}
-                  onChange={(e) =>
-                    setInitialAmount(
-                      e.target.value
-                    )
-                  }
+                  onChange={(e) => setInitialAmount(e.target.value)}
                   placeholder="Ej. 5000"
                   className="rounded-xl"
                 />
@@ -1134,104 +1055,50 @@ function CalculadoraFinanciamientoBNH() {
               </div>
 
               <div>
-                <Label className="mb-2 block">
-                  Financiamiento del
-                  I.V.A.
-                </Label>
+                <Label className="mb-2 block">Financiamiento del I.V.A.</Label>
 
                 <Select
                   value={ivaFinancing}
-                  onValueChange={(
-                    value: PaymentMode
-                  ) =>
-                    setIvaFinancing(
-                      value
-                    )
-                  }
+                  onValueChange={(value: PaymentMode) => setIvaFinancing(value)}
                 >
-                  <SelectTrigger
-                    className="rounded-xl"
-                    style={{
-                      fontFamily:
-                        "Verdana, sans-serif",
-                    }}
-                  >
+                  <SelectTrigger className="rounded-xl" style={selectFont}>
                     <SelectValue placeholder="Seleccione" />
                   </SelectTrigger>
 
-                  <SelectContent
-                    style={{
-                      fontFamily:
-                        "Verdana, sans-serif",
-                    }}
-                  >
-                    <SelectItem
-                      value="si"
-                      style={{
-                        fontFamily:
-                          "Verdana, sans-serif",
-                      }}
-                    >
+                  <SelectContent style={selectFont}>
+                    <SelectItem value="si" style={selectFont}>
                       Sí
                     </SelectItem>
 
-                    {categoryConfig?.canPayVATSeparately ? (
-                      <SelectItem
-                        value="no"
-                        style={{
-                          fontFamily:
-                            "Verdana, sans-serif",
-                        }}
-                      >
-                        No
-                      </SelectItem>
-                    ) : (
-                      <SelectItem
-                        value="no"
-                        disabled
-                        style={{
-                          fontFamily:
-                            "Verdana, sans-serif",
-                        }}
-                      >
-                        No
-                      </SelectItem>
-                    )}
+                    <SelectItem
+                      value="no"
+                      disabled={!categoryConfig?.canPayVATSeparately}
+                      style={selectFont}
+                    >
+                      No
+                    </SelectItem>
                   </SelectContent>
                 </Select>
               </div>
 
               <div>
-                <Label className="mb-2 block">
-                  Cantidad de cuotas
-                </Label>
+                <Label className="mb-2 block">Cantidad de cuotas</Label>
 
                 <Select
                   value={installments}
                   onValueChange={setInstallments}
                   disabled={!categoryConfig || categoryConfig.terms.length === 0}
                 >
-                  <SelectTrigger
-                    className="rounded-xl"
-                    style={{
-                      fontFamily: "Verdana, sans-serif",
-                    }}
-                  >
+                  <SelectTrigger className="rounded-xl" style={selectFont}>
                     <SelectValue placeholder="Seleccione el plazo" />
                   </SelectTrigger>
 
-                  <SelectContent
-                    style={{
-                      fontFamily: "Verdana, sans-serif",
-                    }}
-                  >
+                  <SelectContent style={selectFont}>
                     {(categoryConfig?.terms ?? []).map((term) => (
                       <SelectItem
                         key={term.meses}
                         value={String(term.meses)}
-                        style={{
-                          fontFamily: "Verdana, sans-serif",
-                        }}
+                        style={selectFont}
                       >
                         {term.meses} cuotas
                       </SelectItem>
@@ -1248,27 +1115,13 @@ function CalculadoraFinanciamientoBNH() {
                 </p>
               </div>
 
-              {validations.length >
-                0 && (
+              {validations.length > 0 && (
                 <Alert className="border-red-200 bg-red-50">
                   <AlertDescription>
                     <div className="space-y-1">
-                      {validations.map(
-                        (
-                          message,
-                          index
-                        ) => (
-                          <div
-                            key={
-                              index
-                            }
-                          >
-                            {
-                              message
-                            }
-                          </div>
-                        )
-                      )}
+                      {validations.map((message, index) => (
+                        <div key={index}>{message}</div>
+                      ))}
                     </div>
                   </AlertDescription>
                 </Alert>
@@ -1276,9 +1129,7 @@ function CalculadoraFinanciamientoBNH() {
 
               <Button
                 variant="outline"
-                onClick={
-                  handleReset
-                }
+                onClick={handleReset}
                 className="rounded-xl border-gray-300"
               >
                 Restablecer
@@ -1301,7 +1152,7 @@ function CalculadoraFinanciamientoBNH() {
                     Aplicar Ajuste
                   </p>
                   <p className="text-xs text-gray-500">
-                    
+                    Usa el I.V.A. ajustado del equipo seleccionado
                   </p>
                 </div>
 
@@ -1331,8 +1182,8 @@ function CalculadoraFinanciamientoBNH() {
                 <Alert className="mb-4 border-amber-200 bg-amber-50">
                   <AlertDescription>
                     {selectedEquipoId
-                      ? "El I.V.A. normal."
-                      : "Seleccione un equipo de la lista para aplicar su I.V.A. ; mientras tanto se usa el I.V.A. normal."}
+                      ? "Este equipo no tiene I.V.A. ajustado; se usa el I.V.A. normal."
+                      : "Seleccione un equipo de la lista para aplicar su I.V.A. ajustado; mientras tanto se usa el I.V.A. normal."}
                   </AlertDescription>
                 </Alert>
               )}
@@ -1349,10 +1200,7 @@ function CalculadoraFinanciamientoBNH() {
                     value={formatCurrency(contadoMonto)}
                   />
 
-                  <Item
-                    label="I.V.A."
-                    value={formatCurrency(contadoIva)}
-                  />
+                  <Item label="I.V.A." value={formatCurrency(contadoIva)} />
                 </div>
 
                 <TotalBox title="Total a pagar" total={contadoTotal} />
@@ -1408,13 +1256,13 @@ function CalculadoraFinanciamientoBNH() {
 
                   <Item
                     label="Total a pagar"
-                    value={formatCurrency(calculations.totalToPay)}
+                    value={formatCurrency(isValid ? calculations.totalToPay : 0)}
                   />
                 </div>
 
                 <TotalBox
                   title="Total crédito a pagar"
-                  total={calculations.totalToPay}
+                  total={isValid ? calculations.totalToPay : 0}
                 />
 
                 {SHOW_AIRR_CONTROL &&
@@ -1449,26 +1297,20 @@ function CalculadoraFinanciamientoBNH() {
               </Button>
 
               <p className="mt-2 text-xs text-gray-500">
-                Se generará el PDF de la cotización y se
-                enviará por correo al lead (y al vendedor, si
-                su correo está registrado en la hoja
-                &quot;VENDEDORES&quot;); quedará guardada en
-                el Funel de Venta.
+                Se generará el PDF de la cotización y se enviará por correo al
+                lead (y al vendedor, si su correo está registrado en la hoja
+                &quot;VENDEDORES&quot;); quedará guardada en el Funel de Venta.
               </p>
 
               {sendQuoteError && (
                 <Alert className="mt-4 border-red-200 bg-red-50">
-                  <AlertDescription>
-                    {sendQuoteError}
-                  </AlertDescription>
+                  <AlertDescription>{sendQuoteError}</AlertDescription>
                 </Alert>
               )}
 
               {sendQuoteSuccess && (
                 <Alert className="mt-4 border-green-200 bg-green-50">
-                  <AlertDescription>
-                    {sendQuoteSuccess}
-                  </AlertDescription>
+                  <AlertDescription>{sendQuoteSuccess}</AlertDescription>
                 </Alert>
               )}
             </CardContent>
@@ -1479,33 +1321,17 @@ function CalculadoraFinanciamientoBNH() {
   );
 }
 
-function Item({
-  label,
-  value,
-}: {
-  label: string;
-  value: string;
-}) {
+function Item({ label, value }: { label: string; value: string }) {
   return (
     <div className="rounded-2xl border border-gray-200 bg-white p-4 shadow-sm">
-      <p className="text-gray-500">
-        {label}
-      </p>
+      <p className="text-gray-500">{label}</p>
 
-      <p className="mt-1 font-semibold text-gray-900">
-        {value}
-      </p>
+      <p className="mt-1 font-semibold text-gray-900">{value}</p>
     </div>
   );
 }
 
-function TotalBox({
-  title,
-  total,
-}: {
-  title: string;
-  total: number;
-}) {
+function TotalBox({ title, total }: { title: string; total: number }) {
   return (
     <div className="mt-4 rounded-2xl border border-[#0d6f91]/30 bg-[#0d6f91]/10 p-4">
       <p className="text-sm font-medium text-[#0d6f91]">{title}</p>
