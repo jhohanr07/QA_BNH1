@@ -129,6 +129,14 @@ function calculateIRR(flows: number[]): number {
   }
   return (lo + hi) / 2;
 }
+// Dentro de calculations, después de roundedMonthlyPayment:
+const cuotas = Array(safeInstallments).fill(roundedMonthlyPayment);
+const flows =
+  ivaFinancing === "si"
+    ? [-montoMes0, ...cuotas]
+    : [-montoMes0, ivaCredito, ...cuotas];
+const airrResultante = Math.pow(1 + calculateIRR(flows), 12) - 1;
+
 
 export default function Page() {
   const [isAuthenticated, setIsAuthenticated] =
@@ -659,7 +667,7 @@ function CalculadoraFinanciamientoBNH() {
         ivaFinancing === "si"
           ? [-montoMes0, ...cuotas]
           : [-montoMes0, ivaCredito, ...cuotas];
-      airrResultante = Math.pow(1 + calculateIRR(flows), 12) - 1;
+      const airrResultante = Math.pow(1 + calculateIRR(flows), 12) - 1;
     }
 
     const totalToPay =
